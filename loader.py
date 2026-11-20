@@ -1,671 +1,1688 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-EPSTEIN PUBLIC RECORDS ARCHIVER
-Version: 0.2
+EPSTEIN ARCHIVE
+Local-first public-record collection and verification tool.
 
 Python 3.9+
-Core: Python standard library only.
+Standard library only.
 
-OPTIONAL:
-    smartctl       - SMART health
-    pdftotext      - PDF text extraction
-    pdfinfo        - PDF page count
-    pdftoppm       - PDF page rendering
-    tesseract      - OCR
-    whisper        - audio/video transcription
-    Argos Translate - offline translation
+Features:
+- Source registry
+- Source availability checks
+- HTML discovery crawler
+- Candidate URL preflight
+- SQLite inventory
+- SHA-256 verification
+- Duplicate detection
+- Resumable downloads
+- Retry failed URLs
+- Disk space checks
+- Read-only SMART checks (optional)
+- Monitoring mode
 
-The program:
-    - inventories sources and URLs
-    - discovers files
-    - probes remote endpoints
-    - calculates storage estimates
-    - downloads files with resume support
-    - hashes and verifies files
-    - deduplicates identical downloads
-    - inventories ZIP and TAR archives
-    - performs optional OCR
-    - performs optional translation
-    - performs optional transcription
-    - keeps logs and manifests
-    - supports repeated update cycles
-
-No fixed maximum download size.
-One download at a time.
-No automatic filesystem repair.
+The program does not download suspected illegal intimate material,
+CSAM, or other material marked for manual review.
 """
 
+from __future__ import annotations
+
 import os
-import sys
 import re
-import io
+import sys
 import json
-import csv
 import time
-import html
 import shutil
 import hashlib
 import sqlite3
-import argparse
-import platform
+import logging
+import mimetypes
 import subprocess
 import urllib.request
 import urllib.error
-import urllib.parse
-import urllib.robotparser
-import zipfile
-import tarfile
-import tempfile
-import mimetypes
-import email.message
 
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import (
+    urljoin,
+    urlparse,
+    unquote,
+    urldefrag,
+)
 from html.parser import HTMLParser
+from email.message import Message
 
 
 # ============================================================
-# SETTINGS
+# CONFIGURATION
 # ============================================================
 
-APP_NAME = "EPSTEIN PUBLIC RECORDS ARCHIVER"
-VERSION = "0.2"
+APP_NAME = "EPSTEIN ARCHIVE"
+VERSION = "1.0.0"
 
-BLOCK_SIZE = 1024 * 1024
-HTTP_TIMEOUT = 60
+DEFAULT_ARCHIVE = Path.home() / "EPSTEIN_ARCHIVE"
 
-DEFAULT_RETRIES = 4
-DEFAULT_DELAY = 0.8
-DEFAULT_CRAWL_DEPTH = 2
-DEFAULT_PAGE_LIMIT = 1500
+DATABASE_NAME = "archive.sqlite"
+USER_AGENT = "EpsteinArchiveResearchTool/1.0"
 
-MAX_HTML_SIZE = 5 * 1024 * 1024
+REQUEST_TIMEOUT = 25
+DOWNLOAD_TIMEOUT = 90
 
-USER_AGENT = "PublicRecordsArchive/0.2"
+CRAWL_DEPTH = 2
+CRAWL_PAGE_LIMIT = 250
 
-CRITICAL_HTTP_CODES = {
-    401, 403, 404, 410, 429,
-    500, 502, 503, 504
+CRAWL_DELAY = 0.4
+DOWNLOAD_DELAY = 0.3
+
+MONITOR_INTERVAL_HOURS = 6
+
+CHUNK_SIZE = 1024 * 1024
+HTML_READ_LIMIT = 5 * 1024 * 1024
+
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 3
+
+# Never automatically download URLs that appear to point to
+# potentially illegal intimate material or sensitive personal data.
+MANUAL_REVIEW_PATTERNS = [
+    r"child[-_ ]?porn",
+    r"child[-_ ]?sexual",
+    r"csam",
+    r"sexual[-_ ]?abuse[-_ ]?images",
+    r"nonconsensual[-_ ]?intimate",
+    r"revenge[-_ ]?porn",
+]
+
+# URL patterns that are usually not downloadable documents.
+IGNORE_EXTENSIONS = {
+    ".css", ".js", ".map",
+    ".woff", ".woff2", ".ttf",
+    ".eot", ".ico",
+    ".svg",
 }
 
-SUPPORTED_EXTENSIONS = {
-    ".pdf", ".zip", ".7z", ".rar",
-    ".tar", ".gz", ".tgz", ".bz2",
-    ".csv", ".tsv", ".json", ".jsonl",
-    ".xml", ".txt", ".rtf",
-    ".doc", ".docx", ".xls", ".xlsx",
-    ".ppt", ".pptx", ".odt", ".ods",
-
-    ".mp3", ".wav", ".m4a", ".aac",
-    ".mp4", ".mov", ".avi", ".webm",
-    ".mkv", ".mpeg", ".mpg",
-
-    ".jpg", ".jpeg", ".png", ".gif",
-    ".tif", ".tiff", ".webp", ".bmp"
+DOCUMENT_EXTENSIONS = {
+    ".pdf", ".doc", ".docx",
+    ".xls", ".xlsx", ".csv",
+    ".txt", ".rtf", ".odt",
+    ".ods", ".ppt", ".pptx",
+    ".zip", ".7z", ".rar",
+    ".tar", ".gz", ".bz2",
+    ".json", ".xml",
+    ".jpg", ".jpeg", ".png",
+    ".tif", ".tiff",
+    ".mp3", ".wav", ".mp4",
+    ".mov", ".m4v", ".webm",
 }
 
-MEDIA_EXTENSIONS = {
-    ".mp3", ".wav", ".m4a", ".aac",
-    ".mp4", ".mov", ".avi", ".webm",
-    ".mkv", ".mpeg", ".mpg",
-    ".jpg", ".jpeg", ".png", ".gif",
-    ".tif", ".tiff", ".webp", ".bmp"
-}
 
-DATA_DIRECTORIES = (
+# ============================================================
+# SOURCES
+# ============================================================
+
+# type:
+#   official
+#   court
+#   government
+#   archive
+#   secondary
+#   community
+#
+# trust:
+#   primary
+#   institutional
+#   secondary
+#   community
+#
+# auto_download=False means that discovery is allowed,
+# but automatic downloading is disabled.
+
+SOURCES = [
+
+    # --------------------------------------------------------
+    # US DEPARTMENT OF JUSTICE
+    # --------------------------------------------------------
+
+    {
+        "name": "DOJ Epstein Library",
+        "url": "https://www.justice.gov/epstein",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "DOJ Epstein Disclosures",
+        "url": "https://www.justice.gov/epstein/doj-disclosures",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "DOJ OIG",
+        "url": "https://oig.justice.gov/reports",
+        "type": "government",
+        "trust": "institutional",
+        "auto_download": True,
+    },
+    {
+        "name": "DOJ OPR Epstein Report",
+        "url": "https://www.justice.gov/archives/opa/pr/statement-doj-office-professional-responsibility-report-jeffrey-epstein-2006-2008",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "DOJ OIP Documents",
+        "url": "https://www.justice.gov/oip/available-documents-oip",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": True,
+    },
+
+    # --------------------------------------------------------
+    # FBI
+    # --------------------------------------------------------
+
+    {
+        "name": "FBI Vault Jeffrey Epstein",
+        "url": "https://vault.fbi.gov/jeffrey-epstein/",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "FBI Investigative Holdings Review",
+        "url": "https://vault.fbi.gov/records-regarding-the-review-of-the-investigative-holdings-related-to-jeffrey-epstein/records-regarding-the-review-of-the-investigative-holdings-related-to-jeffrey-epstein",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": True,
+    },
+
+    # --------------------------------------------------------
+    # US CONGRESS
+    # --------------------------------------------------------
+
+    {
+        "name": "House Oversight DOJ Production",
+        "url": "https://oversight.house.gov/release/oversight-committee-releases-epstein-records-provided-by-the-department-of-justice/",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "House Oversight Estate Production",
+        "url": "https://oversight.house.gov/release/oversight-committee-releases-additional-epstein-estate-documents/",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "House DOJ Google Drive",
+        "url": "https://drive.google.com/drive/folders/1TrGxDGQLDLZu1vvvZDBAh-e7wN3y6Hoz?usp=sharing",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": False,
+    },
+    {
+        "name": "House Estate Google Drive",
+        "url": "https://drive.google.com/drive/folders/1hTNH5woIRio578onLGElkTWofUSWRoH_?usp=sharing",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": False,
+    },
+    {
+        "name": "House DOJ Dropbox",
+        "url": "https://www.dropbox.com/scl/fo/98fthv8otekjk28lcrnc5/AIn3egnE58MYe4Bn4fliVBw?dl=0&rlkey=m7p8e9omml96fgxl13kr2nuyt&st=0xvm0p08",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": False,
+    },
+    {
+        "name": "House Estate Dropbox",
+        "url": "https://www.dropbox.com/scl/fo/9bq6uj0pnycpa4gxqiuzs/ABBA-BoYUAT7627MBeLiVYg?rlkey=3s6ggcjihou9nt8srsn2qt1n7&st=4aejaath&dl=0",
+        "type": "official",
+        "trust": "primary",
+        "auto_download": False,
+    },
+
+    # --------------------------------------------------------
+    # COURTS AND LEGAL RECORDS
+    # --------------------------------------------------------
+
+    {
+        "name": "PACER",
+        "url": "https://pacer.uscourts.gov/",
+        "type": "court",
+        "trust": "primary",
+        "auto_download": False,
+    },
+    {
+        "name": "CourtListener",
+        "url": "https://www.courtlistener.com/",
+        "type": "court",
+        "trust": "institutional",
+        "auto_download": True,
+    },
+    {
+        "name": "CourtListener RECAP",
+        "url": "https://www.courtlistener.com/recap/",
+        "type": "court",
+        "trust": "institutional",
+        "auto_download": True,
+    },
+    {
+        "name": "USVI Recorder of Deeds",
+        "url": "https://usvi.publicsearch.us/",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": False,
+    },
+    {
+        "name": "Florida State Attorney 15th Judicial Circuit",
+        "url": "https://sa15.org/public-records/",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+
+    # --------------------------------------------------------
+    # OTHER GOVERNMENT SOURCES
+    # --------------------------------------------------------
+
+    {
+        "name": "CBP Epstein FOIA Records",
+        "url": "https://www.cbp.gov/document/foia-record/jeffrey-epstein-records",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "GovInfo",
+        "url": "https://www.govinfo.gov/",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "Congress.gov",
+        "url": "https://www.congress.gov/",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "Senate Finance",
+        "url": "https://www.finance.senate.gov/",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "Wyden Epstein Report",
+        "url": "https://www.finance.senate.gov/ranking-members-news/wyden-releases-new-report-on-failure-of-wall-street-banks-to-blow-the-whistle-on-jeffrey-epsteins-sex-trafficking-and-money-laundering-schemes",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "National Archives",
+        "url": "https://www.archives.gov/",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "ICE FOIA",
+        "url": "https://www.ice.gov/foia",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "State Department FOIA",
+        "url": "https://foia.state.gov/",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "Treasury FOIA",
+        "url": "https://home.treasury.gov/footer/freedom-of-information-act",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+
+    # --------------------------------------------------------
+    # FINANCIAL AND CORPORATE DATA
+    # --------------------------------------------------------
+
+    {
+        "name": "SEC EDGAR",
+        "url": "https://www.sec.gov/edgar/search/",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "FEC",
+        "url": "https://www.fec.gov/data/",
+        "type": "government",
+        "trust": "primary",
+        "auto_download": True,
+    },
+    {
+        "name": "ICIJ Offshore Leaks",
+        "url": "https://offshoreleaks.icij.org/",
+        "type": "archive",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "OpenCorporates",
+        "url": "https://opencorporates.com/",
+        "type": "archive",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "ProPublica Nonprofit Explorer",
+        "url": "https://projects.propublica.org/nonprofits/",
+        "type": "archive",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+
+    # --------------------------------------------------------
+    # DOCUMENT ARCHIVES
+    # --------------------------------------------------------
+
+    {
+        "name": "DocumentCloud",
+        "url": "https://www.documentcloud.org/",
+        "type": "archive",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "MuckRock",
+        "url": "https://www.muckrock.com/",
+        "type": "archive",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Internet Archive",
+        "url": "https://archive.org/",
+        "type": "archive",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Google Pinpoint",
+        "url": "https://journaliststudio.google.com/pinpoint/search?collection=092314e384a58618",
+        "type": "archive",
+        "trust": "secondary",
+        "auto_download": False,
+    },
+
+    # --------------------------------------------------------
+    # SECONDARY RESEARCH PROJECTS
+    # --------------------------------------------------------
+
+    {
+        "name": "Epstein Files GitHub Index",
+        "url": "https://github.com/yung-megafone/Epstein-Files",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "EpsteinScan",
+        "url": "https://www.epsteinscan.org/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Epstein Exposed",
+        "url": "https://epsteinexposed.com/resources",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Epstein Project",
+        "url": "https://epsteinproject.org/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Epstein Suite",
+        "url": "https://epsteinsuite.com/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Epstein Graph",
+        "url": "https://epsteingraph.com/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Epstein Observer",
+        "url": "https://epstein.observer/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Track the Files",
+        "url": "https://trackthefiles.org/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Epstein Unboxed",
+        "url": "https://www.epsteinunboxed.com/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Search Epstein Files",
+        "url": "https://searchepsteinfiles.com/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Epstein Filez",
+        "url": "https://epsteinfilez.com/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Epstein Forums",
+        "url": "https://epsteinforums.org/",
+        "type": "community",
+        "trust": "community",
+        "auto_download": True,
+    },
+    {
+        "name": "JEEScholar",
+        "url": "https://jeescholar.com/",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+    {
+        "name": "Money Network",
+        "url": "https://tommycarstensen.com/epstein/money_network.html",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": True,
+    },
+
+    # --------------------------------------------------------
+    # JMAIL
+    # --------------------------------------------------------
+
+    {
+        "name": "Jmail About",
+        "url": "https://jmail.world/about",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": False,
+    },
+    {
+        "name": "Jmail Photos",
+        "url": "https://jmail.world/photos",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": False,
+    },
+    {
+        "name": "Jmail Videos",
+        "url": "https://jmail.world/jefftube",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": False,
+    },
+    {
+        "name": "Jmail Flights",
+        "url": "https://jmail.world/flights",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": False,
+    },
+    {
+        "name": "Jmail Taxonomy",
+        "url": "https://jmail.world/taxonomy",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": False,
+    },
+    {
+        "name": "Jmail Wiki",
+        "url": "https://jmail.world/wiki",
+        "type": "secondary",
+        "trust": "secondary",
+        "auto_download": False,
+    },
+
+    # --------------------------------------------------------
+    # COMMUNITY
+    # --------------------------------------------------------
+
+    {
+        "name": "Reddit Research Tools Megathread",
+        "url": "https://www.reddit.com/r/Epstein/comments/1rc3gaz/megathread_list_of_research_tools_and_websites/",
+        "type": "community",
+        "trust": "community",
+        "auto_download": False,
+    },
+    {
+        "name": "Reddit Research Tools Megathread Part 2",
+        "url": "https://www.reddit.com/r/Epstein/comments/1wwsfs8/megathread_list_of_research_tools_and_websites/",
+        "type": "community",
+        "trust": "community",
+        "auto_download": False,
+    },
+]
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def setup_logging(root: Path):
+    log_dir = root / "09_LOGS"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = log_dir / "archive.log"
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+
+def log(level, message):
+    getattr(logging, level.lower())(message)
+
+
+# ============================================================
+# TERMINAL UI
+# ============================================================
+
+def banner():
+    print()
+    print("=" * 72)
+    print("  EPSTEIN ARCHIVE :: PUBLIC RECORD COLLECTION SYSTEM")
+    print("  Version:", VERSION)
+    print("=" * 72)
+    print()
+
+
+def pause():
+    input("\nPress ENTER to continue...")
+
+
+def ask_yes_no(question, default=False):
+    suffix = "[Y/n]" if default else "[y/N]"
+
+    answer = input(f"{question} {suffix}: ").strip().lower()
+
+    if not answer:
+        return default
+
+    return answer in ("y", "yes", "д", "да")
+
+
+def menu():
+    print()
+    print("  [1] Discovery + preflight + download")
+    print("  [2] Verify existing archive")
+    print("  [3] Show archive status")
+    print("  [4] Retry failed URLs")
+    print("  [5] Run monitoring mode")
+    print("  [6] Check disk / SMART")
+    print("  [7] Export manifests")
+    print("  [0] Exit")
+    print()
+
+
+# ============================================================
+# FILESYSTEM LAYOUT
+# ============================================================
+
+DIRECTORIES = [
+    "00_ADMIN",
     "01_RAW_OFFICIAL",
     "02_MEDIA_ARCHIVES",
     "03_SECONDARY_ARCHIVES",
     "04_COMMUNITY_RESEARCH",
-    "05_DERIVED"
-)
-
-IGNORE_SCAN_DIRECTORIES = {
+    "05_DERIVED/OCR",
+    "05_DERIVED/EXTRACTED_TEXT",
+    "05_DERIVED/TRANSCRIPTS",
+    "05_DERIVED/METADATA",
     "06_DATABASE",
     "07_MANIFESTS",
     "08_MONITORING",
     "09_LOGS",
-    "99_STAGING"
-}
+    "99_STAGING/DISCOVERED",
+    "99_STAGING/DOWNLOADING",
+    "99_STAGING/QUARANTINE",
+]
 
-DEFAULT_SETTINGS = {
-    "delay": DEFAULT_DELAY,
-    "retries": DEFAULT_RETRIES,
-    "crawl_depth": DEFAULT_CRAWL_DEPTH,
-    "page_limit": DEFAULT_PAGE_LIMIT,
-    "include_media": False,
-    "respect_robots": True,
-    "verify_every_run": True,
-    "user_agent": USER_AGENT,
-    "internet_archive_query": 'title:(Epstein) AND mediatype:(texts)',
-    "internet_archive_rows": 300,
-    "ocr_languages": "eng+rus",
-    "translation_from": "en",
-    "translation_to": "ru",
-    "whisper_model": "small"
-}
+
+def initialize_layout(root: Path):
+    for item in DIRECTORIES:
+        (root / item).mkdir(parents=True, exist_ok=True)
+
+
+def choose_root():
+    print("Archive directory:")
+    print("Default:", DEFAULT_ARCHIVE)
+
+    raw = input("Path [ENTER = default]: ").strip()
+
+    root = Path(raw).expanduser() if raw else DEFAULT_ARCHIVE
+
+    if not root.exists():
+        if ask_yes_no(f"Directory does not exist. Create {root}?", True):
+            root.mkdir(parents=True, exist_ok=True)
+        else:
+            raise SystemExit("Archive directory was not created.")
+
+    if not root.is_dir():
+        raise SystemExit("Selected path is not a directory.")
+
+    return root.resolve()
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    url TEXT NOT NULL,
+    source_type TEXT,
+    trust_level TEXT,
+    auto_download INTEGER DEFAULT 1,
+    status INTEGER,
+    last_checked TEXT,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT UNIQUE NOT NULL,
+    source_id INTEGER,
+    discovered_from TEXT,
+    depth INTEGER DEFAULT 0,
+    status INTEGER,
+    content_type TEXT,
+    expected_size INTEGER,
+    filename TEXT,
+    last_checked TEXT,
+    error TEXT,
+    manual_review INTEGER DEFAULT 0,
+    excluded_reason TEXT,
+    download_enabled INTEGER DEFAULT 1,
+    FOREIGN KEY(source_id) REFERENCES sources(id)
+);
+
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id INTEGER,
+    source_id INTEGER,
+    url TEXT,
+    path TEXT UNIQUE NOT NULL,
+    filename TEXT,
+    size INTEGER,
+    sha256 TEXT,
+    etag TEXT,
+    last_modified TEXT,
+    downloaded_at TEXT,
+    verification_status TEXT,
+    duplicate_group TEXT,
+    FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    level TEXT,
+    event_type TEXT,
+    url TEXT,
+    message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS crawl_pages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT UNIQUE NOT NULL,
+    source_id INTEGER,
+    status INTEGER,
+    crawled_at TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidates_status
+ON candidates(status);
+
+CREATE INDEX IF NOT EXISTS idx_files_hash
+ON files(sha256);
+
+CREATE INDEX IF NOT EXISTS idx_events_timestamp
+ON events(timestamp);
+"""
+
+
+def connect_db(root: Path):
+    db_path = root / "06_DATABASE" / DATABASE_NAME
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    conn.executescript(SCHEMA)
+    conn.commit()
+
+    return conn
+
+
+def event(db, level, event_type, message, url=None):
+    db.execute(
+        """
+        INSERT INTO events
+        (timestamp, level, event_type, url, message)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now(),
+            level,
+            event_type,
+            url,
+            message,
+        ),
+    )
+    db.commit()
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ============================================================
 # SOURCE REGISTRY
 # ============================================================
 
-# Tiers:
-# OFFICIAL
-# MIRROR
-# SECONDARY
-# COMMUNITY
-
-# Adapters:
-# html
-# google_drive
-# dropbox
-# internet_archive
-
-SOURCES = [
-
-    # DOJ
-
-    ("doj_library",
-     "DOJ Epstein Library",
-     "OFFICIAL",
-     "https://www.justice.gov/epstein",
-     "html"),
-
-    ("doj_disclosures",
-     "DOJ Disclosures",
-     "OFFICIAL",
-     "https://www.justice.gov/epstein/doj-disclosures",
-     "html"),
-
-    ("doj_oip",
-     "DOJ OIP Available Documents",
-     "OFFICIAL",
-     "https://www.justice.gov/oip/available-documents-oip",
-     "html"),
-
-    ("doj_oig_epstein",
-     "DOJ OIG Epstein Report",
-     "OFFICIAL",
-     "https://www.oversight.gov/reports/investigation-and-review-federal-bureau-prisons-custody-care-and-supervision-jeffrey",
-     "html"),
-
-    ("doj_oig",
-     "DOJ Inspector General",
-     "OFFICIAL",
-     "https://oig.justice.gov/reports",
-     "html"),
-
-    ("doj_opr",
-     "DOJ Office of Professional Responsibility",
-     "OFFICIAL",
-     "https://www.justice.gov/archives/opa/pr/statement-doj-office-professional-responsibility-report-jeffrey-epstein-2006-2008",
-     "html"),
-
-    # FBI
-
-    ("fbi_epstein",
-     "FBI Vault Jeffrey Epstein",
-     "OFFICIAL",
-     "https://vault.fbi.gov/jeffrey-epstein/",
-     "html"),
-
-    ("fbi_review",
-     "FBI Investigative Holdings Review",
-     "OFFICIAL",
-     "https://vault.fbi.gov/records-regarding-the-review-of-the-investigative-holdings-related-to-jeffrey-epstein/records-regarding-the-review-of-the-investigative-holdings-related-to-jeffrey-epstein",
-     "html"),
-
-    # CBP / BOP
-
-    ("cbp_epstein",
-     "CBP Epstein FOIA",
-     "OFFICIAL",
-     "https://www.cbp.gov/document/foia-record/jeffrey-epstein-records",
-     "html"),
-
-    ("bop_oig",
-     "BOP / DOJ OIG",
-     "OFFICIAL",
-     "https://oig.justice.gov/",
-     "html"),
-
-    # HOUSE OVERSIGHT
-
-    ("house_oversight",
-     "House Oversight",
-     "OFFICIAL",
-     "https://oversight.house.gov/",
-     "html"),
-
-    ("house_doj_release",
-     "House DOJ Production",
-     "OFFICIAL",
-     "https://oversight.house.gov/release/oversight-committee-releases-epstein-records-provided-by-the-department-of-justice/",
-     "html"),
-
-    ("house_estate_release",
-     "House Estate Production",
-     "OFFICIAL",
-     "https://oversight.house.gov/release/oversight-committee-releases-additional-epstein-estate-documents/",
-     "html"),
-
-    ("house_doj_drive",
-     "House DOJ Google Drive",
-     "MIRROR",
-     "https://drive.google.com/drive/folders/1TrGxDGQLDLZu1vvvZDBAh-e7wN3y6Hoz?usp=sharing",
-     "google_drive"),
-
-    ("house_doj_dropbox",
-     "House DOJ Dropbox",
-     "MIRROR",
-     "https://www.dropbox.com/scl/fo/98fthv8otekjk28lcrnc5/AIn3egnE58MYe4Bn4fliVBw?dl=0&rlkey=m7p8e9omml96fgxl13kr2nuyt&st=0xvm0p08",
-     "dropbox"),
-
-    ("house_estate_drive",
-     "House Estate Google Drive",
-     "MIRROR",
-     "https://drive.google.com/drive/folders/1hTNH5woIRio578onLGElkTWofUSWRoH_?usp=sharing",
-     "google_drive"),
-
-    ("house_estate_dropbox",
-     "House Estate Dropbox",
-     "MIRROR",
-     "https://www.dropbox.com/scl/fo/9bq6uj0pnycpa4gxqiuzs/ABBA-BoYUAT7627MBeLiVYg?rlkey=3s6ggcjihou9nt8srsn2qt1n7&st=4aejaath&dl=0",
-     "dropbox"),
-
-    # SENATE
-
-    ("senate_finance",
-     "Senate Finance Committee",
-     "OFFICIAL",
-     "https://www.finance.senate.gov/ranking-members-news/wyden-releases-new-report-on-failure-of-wall-street-banks-to-blow-the-whistle-on-jeffrey-epsteins-sex-trafficking-and-money-laundering-schemes",
-     "html"),
-
-    # FLORIDA
-
-    ("florida_sa15",
-     "Florida State Attorney 15th Circuit",
-     "OFFICIAL",
-     "https://sa15.org/public-records/",
-     "html"),
-
-    # USVI
-
-    ("usvi_recorder",
-     "USVI Recorder of Deeds",
-     "OFFICIAL",
-     "https://usvi.publicsearch.us/",
-     "html"),
-
-    # COURTS
-
-    ("pacer",
-     "PACER",
-     "OFFICIAL",
-     "https://pacer.uscourts.gov/",
-     "html"),
-
-    ("courtlistener",
-     "CourtListener RECAP",
-     "MIRROR",
-     "https://www.courtlistener.com/",
-     "html"),
-
-    # PRESIDENTIAL LIBRARIES
-
-    ("bush_library",
-     "George H. W. Bush Presidential Library",
-     "OFFICIAL",
-     "https://www.bush41library.gov/",
-     "html"),
-
-    # OTHER GOVERNMENT SOURCES
-
-    ("govinfo",
-     "GovInfo",
-     "OFFICIAL",
-     "https://www.govinfo.gov/",
-     "html"),
-
-    ("sec_edgar",
-     "SEC EDGAR",
-     "OFFICIAL",
-     "https://www.sec.gov/edgar/search/",
-     "html"),
-
-    # FINANCIAL / CORPORATE
-
-    ("propublica",
-     "ProPublica Nonprofit Explorer",
-     "SECONDARY",
-     "https://projects.propublica.org/nonprofits/",
-     "html"),
-
-    ("opencorporates",
-     "OpenCorporates",
-     "SECONDARY",
-     "https://opencorporates.com/",
-     "html"),
-
-    ("icij",
-     "ICIJ Offshore Leaks",
-     "SECONDARY",
-     "https://offshoreleaks.icij.org/",
-     "html"),
-
-    # PUBLIC RECORDS
-
-    ("muckrock",
-     "MuckRock",
-     "SECONDARY",
-     "https://www.muckrock.com/",
-     "html"),
-
-    ("documentcloud",
-     "DocumentCloud",
-     "SECONDARY",
-     "https://www.documentcloud.org/",
-     "html"),
-
-    ("internet_archive",
-     "Internet Archive Epstein Search",
-     "MIRROR",
-     "https://archive.org/advancedsearch.php",
-     "internet_archive"),
-
-    # GOOGLE PINPOINT
-
-    ("google_pinpoint",
-     "Google Pinpoint Estate Collection",
-     "SECONDARY",
-     "https://journaliststudio.google.com/pinpoint/search?collection=092314e384a58618",
-     "html"),
-
-    # GITHUB INDEX
-
-    ("github_index",
-     "Epstein Files GitHub Index",
-     "SECONDARY",
-     "https://github.com/yung-megafone/Epstein-Files",
-     "html"),
-
-    # SEARCH / OCR INDEXES
-
-    ("epsteinscan",
-     "EpsteinScan",
-     "SECONDARY",
-     "https://www.epsteinscan.org/",
-     "html"),
-
-    ("epstein_exposed",
-     "Epstein Exposed",
-     "SECONDARY",
-     "https://epsteinexposed.com/resources",
-     "html"),
-
-    ("epstein_project",
-     "Epstein Project",
-     "SECONDARY",
-     "https://epsteinproject.org/",
-     "html"),
-
-    ("epstein_suite",
-     "Epstein Suite",
-     "SECONDARY",
-     "https://epsteinsuite.com/",
-     "html"),
-
-    ("epstein_museum",
-     "Epstein Museum",
-     "SECONDARY",
-     "https://epsteinmuseum.com/about.html",
-     "html"),
-
-    # JMAIL
-
-    ("jmail_photos",
-     "Jmail Photos",
-     "SECONDARY",
-     "https://jmail.world/photos",
-     "html"),
-
-    ("jmail_videos",
-     "Jmail Videos",
-     "SECONDARY",
-     "https://jmail.world/jefftube",
-     "html"),
-
-    ("jmail_flights",
-     "Jmail Flights",
-     "SECONDARY",
-     "https://jmail.world/flights",
-     "html"),
-
-    ("jmail_taxonomy",
-     "Jmail Taxonomy",
-     "SECONDARY",
-     "https://jmail.world/taxonomy",
-     "html"),
-
-    ("jmail_about",
-     "Jmail About",
-     "SECONDARY",
-     "https://jmail.world/about",
-     "html"),
-
-    ("jmail_wiki",
-     "Jmail Wiki",
-     "SECONDARY",
-     "https://jmail.world/wiki",
-     "html"),
-
-    # OTHER RESEARCH TOOLS
-
-    ("epstein_graph",
-     "Epstein Graph",
-     "SECONDARY",
-     "https://epsteingraph.com/",
-     "html"),
-
-    ("money_network",
-     "Money Network",
-     "SECONDARY",
-     "https://tommycarstensen.com/epstein/money_network.html",
-     "html"),
-
-    ("jeescholar",
-     "JEEScholar",
-     "SECONDARY",
-     "https://jeescholar.com/",
-     "html"),
-
-    ("epstein_observer",
-     "Epstein Observer",
-     "SECONDARY",
-     "https://epstein.observer/",
-     "html"),
-
-    ("track_the_files",
-     "Track the Files",
-     "SECONDARY",
-     "https://trackthefiles.org/",
-     "html"),
-
-    ("epstein_unboxed",
-     "Epstein Unboxed",
-     "SECONDARY",
-     "https://www.epsteinunboxed.com/",
-     "html"),
-
-    ("search_epstein_files",
-     "Search Epstein Files",
-     "SECONDARY",
-     "https://searchepsteinfiles.com/",
-     "html"),
-
-    ("epstein_filez",
-     "Epstein Filez",
-     "SECONDARY",
-     "https://epsteinfilez.com/",
-     "html"),
-
-    ("epstein_forums",
-     "Epstein Forums",
-     "SECONDARY",
-     "https://epsteinforums.org/",
-     "html"),
-
-    # COMMUNITY
-
-    ("reddit_megathread_1",
-     "Reddit Research Megathread",
-     "COMMUNITY",
-     "https://www.reddit.com/r/Epstein/comments/1rc3gaz/megathread_list_of_research_tools_and_websites/",
-     "html"),
-
-    ("reddit_megathread_2",
-     "Reddit Research Megathread Part 2",
-     "COMMUNITY",
-     "https://www.reddit.com/r/Epstein/comments/1wwsfs8/megathread_list_of_research_tools_and_websites/",
-     "html"),
-]
+def register_sources(db):
+    for source in SOURCES:
+        db.execute(
+            """
+            INSERT INTO sources
+            (name, url, source_type, trust_level, auto_download)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                url=excluded.url,
+                source_type=excluded.source_type,
+                trust_level=excluded.trust_level,
+                auto_download=excluded.auto_download
+            """,
+            (
+                source["name"],
+                source["url"],
+                source["type"],
+                source["trust"],
+                int(source.get("auto_download", True)),
+            ),
+        )
+
+    db.commit()
+
+
+def get_source_id(db, name):
+    row = db.execute(
+        "SELECT id FROM sources WHERE name=?",
+        (name,),
+    ).fetchone()
+
+    return row["id"] if row else None
 
 
 # ============================================================
-# DIRECTORY STRUCTURE
+# HTTP
 # ============================================================
 
-DIRECTORIES = [
+def make_request(url, method="GET", headers=None):
+    request_headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+    }
 
-    "00_ADMIN",
+    if headers:
+        request_headers.update(headers)
 
-    "01_RAW_OFFICIAL/DOJ",
-    "01_RAW_OFFICIAL/FBI",
-    "01_RAW_OFFICIAL/CBP",
-    "01_RAW_OFFICIAL/BOP",
-    "01_RAW_OFFICIAL/HOUSE_OVERSIGHT/DOJ",
-    "01_RAW_OFFICIAL/HOUSE_OVERSIGHT/ESTATE",
-    "01_RAW_OFFICIAL/HOUSE_OVERSIGHT/TRANSCRIPTS",
-    "01_RAW_OFFICIAL/SENATE_FINANCE",
-    "01_RAW_OFFICIAL/DOJ_OIG",
-    "01_RAW_OFFICIAL/DOJ_OPR",
-    "01_RAW_OFFICIAL/FLORIDA",
-    "01_RAW_OFFICIAL/US_VIRGIN_ISLANDS",
-    "01_RAW_OFFICIAL/FEDERAL_COURTS",
-    "01_RAW_OFFICIAL/PRESIDENTIAL_LIBRARIES",
-    "01_RAW_OFFICIAL/SEC",
-    "01_RAW_OFFICIAL/CORPORATE_REGISTRIES",
-    "01_RAW_OFFICIAL/FOIA_EXTERNAL",
+    req = urllib.request.Request(
+        url,
+        headers=request_headers,
+        method=method,
+    )
 
-    "02_MEDIA_ARCHIVES/JMAIL/PHOTOS",
-    "02_MEDIA_ARCHIVES/JMAIL/VIDEOS",
-    "02_MEDIA_ARCHIVES/JMAIL/EMAILS",
-    "02_MEDIA_ARCHIVES/JMAIL/FLIGHTS",
-    "02_MEDIA_ARCHIVES/JMAIL/TAXONOMY",
-    "02_MEDIA_ARCHIVES/OFFICIAL_AUDIO",
-    "02_MEDIA_ARCHIVES/OFFICIAL_VIDEO",
-    "02_MEDIA_ARCHIVES/OFFICIAL_PHOTOS",
-
-    "03_SECONDARY_ARCHIVES/COURTLISTENER",
-    "03_SECONDARY_ARCHIVES/GOOGLE_PINPOINT",
-    "03_SECONDARY_ARCHIVES/INTERNET_ARCHIVE",
-    "03_SECONDARY_ARCHIVES/EPSTEIN_PROJECT",
-    "03_SECONDARY_ARCHIVES/EPSTEIN_EXPOSED",
-    "03_SECONDARY_ARCHIVES/EPSTEINSCAN",
-    "03_SECONDARY_ARCHIVES/OTHER_MIRRORS",
-
-    "04_COMMUNITY_RESEARCH/FORUMS",
-    "04_COMMUNITY_RESEARCH/TRANSCRIPTIONS",
-    "04_COMMUNITY_RESEARCH/RESEARCH_REPORTS",
-    "04_COMMUNITY_RESEARCH/FINANCIAL_ANALYSIS",
-    "04_COMMUNITY_RESEARCH/NETWORK_GRAPHS",
-    "04_COMMUNITY_RESEARCH/TIMELINES",
-
-    "05_DERIVED/OCR",
-    "05_DERIVED/EXTRACTED_TEXT",
-    "05_DERIVED/TRANSLATIONS",
-    "05_DERIVED/TRANSCRIPTS",
-    "05_DERIVED/METADATA",
-    "05_DERIVED/THUMBNAILS",
-
-    "06_DATABASE",
-    "07_MANIFESTS",
-    "08_MONITORING",
-    "09_LOGS",
-
-    "99_STAGING/DISCOVERED",
-    "99_STAGING/DOWNLOADING",
-    "99_STAGING/QUARANTINE"
-]
+    return urllib.request.urlopen(
+        req,
+        timeout=REQUEST_TIMEOUT,
+    )
 
 
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
+def probe_url(url):
+    """
+    Return:
+        status, content_type, content_length, final_url, error
+    """
 
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def say(text=""):
-    print(text, flush=True)
-
-
-def pause():
     try:
-        input("\nPress Enter...")
-    except EOFError:
+        response = make_request(url, "HEAD")
+
+        status = response.getcode()
+        headers = response.headers
+        final_url = response.geturl()
+
+        content_type = headers.get("Content-Type")
+        content_length = headers.get("Content-Length")
+
+        size = None
+
+        if content_length and content_length.isdigit():
+            size = int(content_length)
+
+        response.close()
+
+        return status, content_type, size, final_url, None
+
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+
+        if status not in (405, 501):
+            return status, None, None, url, str(exc)
+
+    except Exception as exc:
+        log("debug", f"HEAD failed: {url}: {exc}")
+
+    # Fallback to Range GET.
+
+    try:
+        response = make_request(
+            url,
+            "GET",
+            {"Range": "bytes=0-0"},
+        )
+
+        status = response.getcode()
+        headers = response.headers
+
+        content_type = headers.get("Content-Type")
+        content_length = headers.get("Content-Length")
+
+        size = None
+
+        content_range = headers.get("Content-Range")
+
+        if content_range:
+            match = re.search(r"/(\d+)$", content_range)
+
+            if match:
+                size = int(match.group(1))
+
+        elif content_length and content_length.isdigit():
+            size = int(content_length)
+
+        final_url = response.geturl()
+
+        response.close()
+
+        return status, content_type, size, final_url, None
+
+    except urllib.error.HTTPError as exc:
+        return exc.code, None, None, url, str(exc)
+
+    except Exception as exc:
+        return None, None, None, url, str(exc)
+
+
+def is_success(status):
+    return status is not None and 200 <= status < 400
+
+
+# ============================================================
+# SOURCE AVAILABILITY CHECK
+# ============================================================
+
+def probe_sources(db):
+    print("\n[PHASE 1] SOURCE AVAILABILITY CHECK\n")
+
+    rows = db.execute(
+        "SELECT * FROM sources ORDER BY id"
+    ).fetchall()
+
+    for row in rows:
+        url = row["url"]
+
+        log("info", f"Checking source: {row['name']}")
+
+        status, ctype, size, final_url, error = probe_url(url)
+
+        db.execute(
+            """
+            UPDATE sources
+            SET status=?, last_checked=?, error=?
+            WHERE id=?
+            """,
+            (
+                status,
+                utc_now(),
+                error,
+                row["id"],
+            ),
+        )
+
+        if is_success(status):
+            log("info", f"AVAILABLE [{status}] {row['name']}")
+        else:
+            log(
+                "warning",
+                f"UNAVAILABLE [{status}] {row['name']} :: {error}",
+            )
+
+        event(
+            db,
+            "INFO" if is_success(status) else "WARN",
+            "SOURCE_PROBE",
+            f"HTTP {status}; {error or 'OK'}",
+            url,
+        )
+
+        db.commit()
+        time.sleep(CRAWL_DELAY)
+
+
+# ============================================================
+# HTML LINK EXTRACTION
+# ============================================================
+
+class LinkParser(HTMLParser):
+
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+
+        for key in ("href", "src", "data-href"):
+            value = attrs.get(key)
+
+            if value:
+                self.links.append(value)
+
+
+def extract_links(html, base_url):
+    parser = LinkParser()
+
+    try:
+        parser.feed(html)
+    except Exception:
         pass
 
+    result = []
 
-def human_size(value):
+    for link in parser.links:
+        absolute = urljoin(base_url, link)
+        absolute, _ = urldefrag(absolute)
 
+        parsed = urlparse(absolute)
+
+        if parsed.scheme not in ("http", "https"):
+            continue
+
+        result.append(absolute)
+
+    return list(dict.fromkeys(result))
+
+
+# ============================================================
+# URL CLASSIFICATION
+# ============================================================
+
+def is_manual_review_url(url):
+    text = unquote(url).lower()
+
+    for pattern in MANUAL_REVIEW_PATTERNS:
+        if re.search(pattern, text, re.I):
+            return True
+
+    return False
+
+
+def extension_of(url):
+    path = unquote(urlparse(url).path)
+    return Path(path).suffix.lower()
+
+
+def looks_like_document(url, content_type=None):
+    ext = extension_of(url)
+
+    if ext in IGNORE_EXTENSIONS:
+        return False
+
+    if ext in DOCUMENT_EXTENSIONS:
+        return True
+
+    if content_type:
+        ctype = content_type.lower()
+
+        if any(x in ctype for x in (
+            "pdf",
+            "msword",
+            "officedocument",
+            "spreadsheet",
+            "presentation",
+            "octet-stream",
+            "text/plain",
+            "text/csv",
+            "image/",
+            "video/",
+            "audio/",
+            "application/zip",
+        )):
+            return True
+
+    return False
+
+
+def filename_from_url(url):
+    name = Path(unquote(urlparse(url).path)).name
+
+    if not name:
+        name = "download"
+
+    name = re.sub(r"[^A-Za-z0-9._() -]", "_", name)
+
+    return name[:180]
+
+
+def safe_filename(name):
+    name = unquote(name or "download")
+
+    name = name.replace("/", "_")
+    name = name.replace("\\", "_")
+
+    name = re.sub(r"[^A-Za-z0-9._() -]", "_", name)
+
+    return name[:180] or "download"
+
+
+def candidate_directory(source_type):
+    mapping = {
+        "official": "01_RAW_OFFICIAL",
+        "court": "01_RAW_OFFICIAL/FEDERAL_COURTS",
+        "government": "01_RAW_OFFICIAL/FOIA_EXTERNAL",
+        "archive": "03_SECONDARY_ARCHIVES",
+        "secondary": "03_SECONDARY_ARCHIVES",
+        "community": "04_COMMUNITY_RESEARCH",
+    }
+
+    return mapping.get(source_type, "99_STAGING/DISCOVERED")
+
+
+# ============================================================
+# CANDIDATE REGISTRATION
+# ============================================================
+
+def add_candidate(
+    db,
+    url,
+    source_id,
+    discovered_from,
+    depth,
+    download_enabled=True,
+):
+    if not url.startswith(("http://", "https://")):
+        return
+
+    manual = is_manual_review_url(url)
+
+    if manual:
+        download_enabled = False
+
+    db.execute(
+        """
+        INSERT INTO candidates
+        (
+            url,
+            source_id,
+            discovered_from,
+            depth,
+            manual_review,
+            download_enabled,
+            excluded_reason
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(url) DO UPDATE SET
+            discovered_from=COALESCE(
+                candidates.discovered_from,
+                excluded.discovered_from
+            )
+        """,
+        (
+            url,
+            source_id,
+            discovered_from,
+            depth,
+            int(manual),
+            int(download_enabled),
+            "Potentially sensitive URL; manual review required"
+            if manual else None,
+        ),
+    )
+
+    db.commit()
+
+
+# ============================================================
+# CRAWLER
+# ============================================================
+
+def fetch_html(url):
+    try:
+        response = make_request(url, "GET")
+
+        status = response.getcode()
+        content_type = response.headers.get("Content-Type", "")
+
+        if "html" not in content_type.lower():
+            response.close()
+            return status, None, content_type, response.geturl()
+
+        data = response.read(HTML_READ_LIMIT + 1)
+        response.close()
+
+        if len(data) > HTML_READ_LIMIT:
+            data = data[:HTML_READ_LIMIT]
+
+        encoding = "utf-8"
+
+        charset_match = re.search(
+            r"charset=([A-Za-z0-9_-]+)",
+            content_type,
+            re.I,
+        )
+
+        if charset_match:
+            encoding = charset_match.group(1)
+
+        try:
+            html = data.decode(encoding, errors="replace")
+        except LookupError:
+            html = data.decode("utf-8", errors="replace")
+
+        return status, html, content_type, response.geturl()
+
+    except urllib.error.HTTPError as exc:
+        return exc.code, None, None, url
+
+    except Exception as exc:
+        log("warning", f"HTML fetch failed: {url}: {exc}")
+        return None, None, None, url
+
+
+def crawl_source(db, source, source_id):
+    print(f"\n[CRAWL] {source['name']}")
+
+    start_url = source["url"]
+
+    queue = [(start_url, 0)]
+    visited = set()
+
+    allowed_hosts = {
+        urlparse(start_url).netloc.lower()
+    }
+
+    page_count = 0
+
+    while queue and page_count < CRAWL_PAGE_LIMIT:
+
+        url, depth = queue.pop(0)
+
+        if url in visited:
+            continue
+
+        visited.add(url)
+
+        if depth > CRAWL_DEPTH:
+            continue
+
+        page_count += 1
+
+        log("debug", f"CRAWL {depth}: {url}")
+
+        status, html, ctype, final_url = fetch_html(url)
+
+        db.execute(
+            """
+            INSERT INTO crawl_pages
+            (url, source_id, status, crawled_at, error)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET
+                status=excluded.status,
+                crawled_at=excluded.crawled_at,
+                error=excluded.error
+            """,
+            (
+                url,
+                source_id,
+                status,
+                utc_now(),
+                None if html is not None else "Page unavailable or non-HTML",
+            ),
+        )
+
+        db.commit()
+
+        if not html:
+            continue
+
+        links = extract_links(html, final_url)
+
+        for link in links:
+
+            parsed = urlparse(link)
+            host = parsed.netloc.lower()
+
+            ext = extension_of(link)
+
+            if ext in IGNORE_EXTENSIONS:
+                continue
+
+            manual = is_manual_review_url(link)
+
+            if looks_like_document(link):
+                add_candidate(
+                    db,
+                    link,
+                    source_id,
+                    url,
+                    depth + 1,
+                    source.get("auto_download", True) and not manual,
+                )
+
+            # Follow same-host links.
+            # Known document-storage hosts are allowed as external
+            # discoveries, but are not recursively crawled.
+
+            if host in allowed_hosts and depth < CRAWL_DEPTH:
+                if link not in visited:
+                    queue.append((link, depth + 1))
+
+        time.sleep(CRAWL_DELAY)
+
+    log(
+        "info",
+        f"Finished {source['name']}: {page_count} pages visited",
+    )
+
+
+def discover_all(db):
+    print("\n[PHASE 2] DEEP DISCOVERY\n")
+
+    sources = db.execute(
+        "SELECT * FROM sources ORDER BY id"
+    ).fetchall()
+
+    for row in sources:
+        source = {
+            "name": row["name"],
+            "url": row["url"],
+            "auto_download": bool(row["auto_download"]),
+        }
+
+        try:
+            crawl_source(
+                db,
+                source,
+                row["id"],
+            )
+
+        except KeyboardInterrupt:
+            raise
+
+        except Exception as exc:
+            log(
+                "error",
+                f"Source crawler failed: {row['name']}: {exc}",
+            )
+
+            event(
+                db,
+                "ERROR",
+                "CRAWLER_FAILURE",
+                str(exc),
+                row["url"],
+            )
+
+
+# ============================================================
+# CANDIDATE PREFLIGHT
+# ============================================================
+
+def probe_candidates(db):
+    print("\n[PHASE 3] INDIVIDUAL URL PREFLIGHT\n")
+
+    rows = db.execute(
+        """
+        SELECT *
+        FROM candidates
+        ORDER BY id
+        """
+    ).fetchall()
+
+    total = len(rows)
+
+    print("Candidates:", total)
+
+    for index, row in enumerate(rows, 1):
+
+        url = row["url"]
+
+        log(
+            "info",
+            f"[{index}/{total}] Checking {url}",
+        )
+
+        status, ctype, size, final_url, error = probe_url(url)
+
+        db.execute(
+            """
+            UPDATE candidates
+            SET status=?,
+                content_type=?,
+                expected_size=?,
+                last_checked=?,
+                error=?
+            WHERE id=?
+            """,
+            (
+                status,
+                ctype,
+                size,
+                utc_now(),
+                error,
+                row["id"],
+            ),
+        )
+
+        db.commit()
+
+        if is_success(status):
+            log(
+                "info",
+                f"AVAILABLE [{status}] size={size} type={ctype}",
+            )
+        else:
+            log(
+                "warning",
+                f"FAILED [{status}] {error or ''}",
+            )
+
+        event(
+            db,
+            "INFO" if is_success(status) else "WARN",
+            "CANDIDATE_PREFLIGHT",
+            f"HTTP={status}; size={size}; type={ctype}; error={error}",
+            url,
+        )
+
+        time.sleep(CRAWL_DELAY)
+
+    failed = db.execute(
+        """
+        SELECT *
+        FROM candidates
+        WHERE status IS NULL OR status < 200 OR status >= 400
+        ORDER BY status, url
+        """
+    ).fetchall()
+
+    print("\nFAILED / UNAVAILABLE URLS:", len(failed))
+
+    for row in failed:
+        print(
+            f"  [{row['status']}] {row['url']}"
+        )
+
+    if failed and ask_yes_no(
+        "Retry failed URL checks now?",
+        False,
+    ):
+        retry_candidate_probes(db, failed)
+
+
+def retry_candidate_probes(db, rows):
+    print("\n[RETRY] Failed URL checks\n")
+
+    for row in rows:
+
+        status = None
+        ctype = None
+        size = None
+        error = None
+
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+
+            log(
+                "info",
+                f"Retry {attempt}/{RETRY_ATTEMPTS}: {row['url']}",
+            )
+
+            status, ctype, size, final_url, error = probe_url(
+                row["url"]
+            )
+
+            if is_success(status):
+                break
+
+            time.sleep(RETRY_DELAY * attempt)
+
+        db.execute(
+            """
+            UPDATE candidates
+            SET status=?,
+                content_type=?,
+                expected_size=?,
+                last_checked=?,
+                error=?
+            WHERE id=?
+            """,
+            (
+                status,
+                ctype,
+                size,
+                utc_now(),
+                error,
+                row["id"],
+            ),
+        )
+
+        db.commit()
+
+
+# ============================================================
+# DISK CHECKS
+# ============================================================
+
+def disk_status(root: Path):
+    usage = shutil.disk_usage(root)
+
+    print("\nDISK STATUS")
+    print("-" * 50)
+    print("Total:     ", format_bytes(usage.total))
+    print("Used:      ", format_bytes(usage.used))
+    print("Free:      ", format_bytes(usage.free))
+
+    return usage
+
+
+def format_bytes(value):
     if value is None:
-        return "unknown"
+        return "UNKNOWN"
+
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
 
     value = float(value)
 
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+    for unit in units:
         if value < 1024:
-            return "%.2f %s" % (value, unit)
+            return f"{value:.2f} {unit}"
 
         value /= 1024
 
-    return "%.2f PiB" % value
+    return f"{value:.2f} EB"
 
 
-def safe_name(value):
+def check_smart():
+    print("\nSMART CHECK")
 
-    value = re.sub(
-        r"[^A-Za-z0-9._() -]+",
-        "_",
-        str(value)
-    )
+    executable = shutil.which("smartctl")
 
-    value = value.strip(" .")
+    if not executable:
+        print("smartctl not installed; SMART check skipped.")
+        return
 
-    return value[:150] or "unknown"
+    try:
+        scan = subprocess.run(
+            [executable, "--scan"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+        devices = []
+
+        for line in scan.stdout.splitlines():
+            match = re.match(r"^(/dev/\S+)", line)
+
+            if match:
+                devices.append(match.group(1))
+
+        if not devices:
+            print("No SMART devices detected.")
+            return
+
+        for device in devices:
+            print("\nDevice:", device)
+
+            result = subprocess.run(
+                [
+                    executable,
+                    "-H",
+                    device,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            print(result.stdout or result.stderr)
+
+    except Exception as exc:
+        log("warning", f"SMART check failed: {exc}")
 
 
-def url_hash(url):
+# ============================================================
+# DOWNLOAD ESTIMATION
+# ============================================================
 
-    return hashlib.sha256(
-        url.encode("utf-8")
-    ).hexdigest()
+def estimate_download(db):
+    row = db.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            SUM(expected_size) AS known_size,
+            SUM(CASE WHEN expected_size IS NULL THEN 1 ELSE 0 END)
+                AS unknown_size
+        FROM candidates
+        WHERE status >= 200
+          AND status < 400
+          AND download_enabled=1
+          AND manual_review=0
+        """
+    ).fetchone()
+
+    known_size = row["known_size"] or 0
+
+    print("\nDOWNLOAD ESTIMATE")
+    print("-" * 50)
+    print("Available candidates:", row["total"])
+    print("Known total size:    ", format_bytes(known_size))
+    print("Unknown-size URLs:   ", row["unknown_size"])
+
+    return known_size, row["unknown_size"]
 
 
-def file_sha256(path):
+def candidates_for_download(db):
+    return db.execute(
+        """
+        SELECT c.*, s.name AS source_name,
+               s.source_type AS source_type,
+               s.trust_level AS trust_level
+        FROM candidates c
+        LEFT JOIN sources s ON s.id=c.source_id
+        WHERE c.status >= 200
+          AND c.status < 400
+          AND c.download_enabled=1
+          AND c.manual_review=0
+          AND c.excluded_reason IS NULL
+        ORDER BY
+            CASE s.trust_level
+                WHEN 'primary' THEN 1
+                WHEN 'institutional' THEN 2
+                WHEN 'secondary' THEN 3
+                ELSE 4
+            END,
+            c.id
+        """
+    ).fetchall()
 
+
+# ============================================================
+# HASHING AND LOCAL INVENTORY
+# ============================================================
+
+def sha256_file(path: Path):
     digest = hashlib.sha256()
 
-    with open(path, "rb") as source:
-
+    with path.open("rb") as handle:
         while True:
-
-            block = source.read(BLOCK_SIZE)
+            block = handle.read(CHUNK_SIZE)
 
             if not block:
                 break
@@ -675,4474 +1692,1108 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def normalize_url(url):
+def inventory(root: Path, db):
+    print("\n[INVENTORY] Scanning selected archive directory")
 
-    if not url:
-        return None
+    count = 0
 
-    url = urllib.parse.urldefrag(url)[0]
+    for path in root.rglob("*"):
 
-    parsed = urllib.parse.urlsplit(url)
+        if not path.is_file():
+            continue
 
-    if parsed.scheme not in ("http", "https"):
-        return None
+        if path.name.endswith(".part"):
+            continue
 
-    return url
-
-
-def get_extension(path):
-
-    return Path(
-        urllib.parse.urlsplit(path).path
-    ).suffix.lower()
-
-
-def filename_from_url(url):
-
-    parsed = urllib.parse.urlsplit(url)
-
-    name = urllib.parse.unquote(
-        parsed.path.rsplit("/", 1)[-1]
-    )
-
-    name = safe_name(name)
-
-    if name == "unknown":
-        name = "download"
-
-    return name
-
-
-def parse_content_disposition(value):
-
-    if not value:
-        return None
-
-    message = email.message.Message()
-
-    message["content-disposition"] = value
-
-    name = message.get_filename()
-
-    if name:
-        return safe_name(name)
-
-    match = re.search(
-        r'filename="?([^";]+)',
-        value,
-        re.I
-    )
-
-    if match:
-        return safe_name(match.group(1))
-
-    return None
-
-
-def write_json(path, data):
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w", encoding="utf-8") as output:
-
-        json.dump(
-            data,
-            output,
-            indent=2,
-            ensure_ascii=False
-        )
-
-
-# ============================================================
-# INITIALIZATION
-# ============================================================
-
-def initialize(root):
-
-    root.mkdir(parents=True, exist_ok=True)
-
-    for item in DIRECTORIES:
-
-        (root / item).mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-    readme = root / "00_ADMIN" / "README.txt"
-
-    if not readme.exists():
-
-        readme.write_text(
-            APP_NAME + "\n\n"
-            "Archive of publicly released records.\n"
-            "Original files are stored separately from derived data.\n"
-            "OCR, transcripts and translations are not originals.\n"
-            "Preserve provenance and SHA-256 checksums.\n",
-            encoding="utf-8"
-        )
-
-    policy = root / "00_ADMIN" / "COLLECTION_POLICY.txt"
-
-    if not policy.exists():
-
-        policy.write_text(
-            "COLLECTION POLICY\n\n"
-            "1. Prefer official primary sources.\n"
-            "2. Keep mirrors labelled as mirrors.\n"
-            "3. Preserve original bytes and filenames.\n"
-            "4. Save source URLs and SHA-256 hashes.\n"
-            "5. Keep OCR, translation and transcripts separate.\n"
-            "6. Do not store or redistribute CSAM, intimate victim images,\n"
-            "   or unredacted sensitive personal information.\n"
-            "7. Record exclusions without retaining restricted contents.\n"
-            "8. A person's mention in a document is not proof of wrongdoing.\n",
-            encoding="utf-8"
-        )
-
-    settings_path = root / "00_ADMIN" / "settings.json"
-
-    if not settings_path.exists():
-        write_json(settings_path, DEFAULT_SETTINGS)
-
-    db = open_database(root)
-
-    register_sources(db)
-
-    db.close()
-
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-def open_database(root):
-
-    database = root / "06_DATABASE" / "archive.sqlite"
-
-    db = sqlite3.connect(str(database))
-
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=NORMAL")
-    db.execute("PRAGMA foreign_keys=ON")
-
-    db.executescript("""
-
-    CREATE TABLE IF NOT EXISTS sources (
-
-        source_id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        tier TEXT NOT NULL,
-        url TEXT NOT NULL,
-        adapter TEXT NOT NULL,
-
-        active INTEGER DEFAULT 1,
-
-        last_checked TEXT,
-        status TEXT,
-        notes TEXT
-
-    );
-
-    CREATE TABLE IF NOT EXISTS pages (
-
-        url TEXT PRIMARY KEY,
-        source_id TEXT,
-
-        status_code INTEGER,
-        last_checked TEXT,
-
-        error TEXT
-
-    );
-
-    CREATE TABLE IF NOT EXISTS items (
-
-        url TEXT PRIMARY KEY,
-
-        discovered_at TEXT,
-        last_seen TEXT,
-
-        status_code INTEGER,
-        content_type TEXT,
-
-        size_hint INTEGER,
-        filename TEXT,
-
-        etag TEXT,
-        last_modified TEXT,
-
-        local_path TEXT,
-        sha256 TEXT,
-
-        state TEXT,
-        error TEXT
-
-    );
-
-    CREATE TABLE IF NOT EXISTS item_sources (
-
-        url TEXT NOT NULL,
-        source_id TEXT NOT NULL,
-
-        PRIMARY KEY (url, source_id)
-
-    );
-
-    CREATE TABLE IF NOT EXISTS files (
-
-        local_path TEXT PRIMARY KEY,
-
-        size INTEGER,
-        mtime_ns INTEGER,
-
-        baseline_sha256 TEXT,
-        observed_sha256 TEXT,
-
-        verified_at TEXT,
-        state TEXT,
-
-        source_url TEXT
-
-    );
-
-    CREATE TABLE IF NOT EXISTS archive_members (
-
-        archive_path TEXT,
-        member_path TEXT,
-
-        size INTEGER,
-        compressed_size INTEGER,
-
-        crc TEXT,
-        kind TEXT,
-
-        scanned_at TEXT,
-
-        PRIMARY KEY (archive_path, member_path)
-
-    );
-
-    CREATE TABLE IF NOT EXISTS events (
-
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        at TEXT,
-        level TEXT,
-
-        event TEXT,
-        url TEXT,
-
-        detail TEXT
-
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_items_state
-        ON items(state);
-
-    CREATE INDEX IF NOT EXISTS idx_items_source
-        ON item_sources(source_id);
-
-    CREATE INDEX IF NOT EXISTS idx_files_sha
-        ON files(baseline_sha256);
-
-    """)
-
-    db.commit()
-
-    return db
-
-
-def register_sources(db):
-
-    for source in SOURCES:
-
-        sid, name, tier, url, adapter = source
-
-        db.execute(
-            """
-            INSERT OR IGNORE INTO sources
-            (source_id,name,tier,url,adapter)
-            VALUES(?,?,?,?,?)
-            """,
-            (sid, name, tier, url, adapter)
-        )
-
-    db.commit()
-
-
-def log_event(db, level, event_name, url="", detail=""):
-
-    db.execute(
-        """
-        INSERT INTO events(at,level,event,url,detail)
-        VALUES(?,?,?,?,?)
-        """,
-        (
-            now(),
-            level,
-            event_name,
-            url,
-            str(detail)[:4000]
-        )
-    )
-
-    db.commit()
-
-
-def get_settings(root):
-
-    path = root / "00_ADMIN" / "settings.json"
-
-    settings = dict(DEFAULT_SETTINGS)
-
-    if path.exists():
+        if path.name == DATABASE_NAME:
+            continue
 
         try:
-
-            with open(path, encoding="utf-8") as source:
-                stored = json.load(source)
-
-            settings.update(stored)
-
-        except Exception:
-            pass
-
-    return settings
-
-
-def save_settings(root, settings):
-
-    write_json(
-        root / "00_ADMIN" / "settings.json",
-        settings
-    )
-
-
-# ============================================================
-# SOURCE MANAGEMENT
-# ============================================================
-
-def add_custom_source(db):
-
-    say("\nADD SOURCE")
-
-    name = input("Name: ").strip()
-    url = input("URL: ").strip()
-
-    if not name or not url:
-        say("Missing name or URL.")
-        return
-
-    url = normalize_url(url)
-
-    if not url:
-        say("Invalid URL.")
-        return
-
-    print("\nTier:")
-    print("1. OFFICIAL")
-    print("2. MIRROR")
-    print("3. SECONDARY")
-    print("4. COMMUNITY")
-
-    choice = input("Choice: ").strip()
-
-    tiers = {
-        "1": "OFFICIAL",
-        "2": "MIRROR",
-        "3": "SECONDARY",
-        "4": "COMMUNITY"
-    }
-
-    tier = tiers.get(choice, "SECONDARY")
-
-    print("\nAdapter:")
-    print("1. HTML")
-    print("2. Google Drive")
-    print("3. Dropbox")
-    print("4. Internet Archive")
-
-    adapter_choice = input("Choice: ").strip()
-
-    adapters = {
-        "1": "html",
-        "2": "google_drive",
-        "3": "dropbox",
-        "4": "internet_archive"
-    }
-
-    adapter = adapters.get(adapter_choice, "html")
-
-    sid = safe_name(
-        input("Source ID (Enter = generated): ").strip()
-        or name.lower().replace(" ", "_")
-    )
-
-    db.execute(
-        """
-        INSERT OR REPLACE INTO sources
-        (source_id,name,tier,url,adapter,active,status)
-        VALUES(?,?,?,?,?,1,'REGISTERED')
-        """,
-        (sid, name, tier, url, adapter)
-    )
-
-    db.commit()
-
-    say("Source saved.")
-
-
-def list_sources(db):
-
-    rows = db.execute(
-        """
-        SELECT source_id,name,tier,adapter,active,status
-        FROM sources
-        ORDER BY tier,name
-        """
-    ).fetchall()
-
-    say("\nSOURCE REGISTRY")
-
-    for row in rows:
-
-        sid, name, tier, adapter, active, status = row
-
-        flag = "ON" if active else "OFF"
-
-        say(
-            "%-22s | %-10s | %-15s | %-3s | %s" %
-            (
-                sid[:22],
-                tier,
-                adapter,
-                flag,
-                name
-            )
-        )
-
-
-def toggle_source(db):
-
-    list_sources(db)
-
-    sid = input("\nSource ID: ").strip()
-
-    row = db.execute(
-        "SELECT active FROM sources WHERE source_id=?",
-        (sid,)
-    ).fetchone()
-
-    if row is None:
-        say("Unknown source.")
-        return
-
-    new_value = 0 if row[0] else 1
-
-    db.execute(
-        "UPDATE sources SET active=? WHERE source_id=?",
-        (new_value, sid)
-    )
-
-    db.commit()
-
-    say("Source status updated.")
-
-
-# ============================================================
-# HTTP
-# ============================================================
-
-HOST_TIMES = {}
-ROBOTS_CACHE = {}
-
-
-def wait_for_host(url, settings):
-
-    host = urllib.parse.urlsplit(url).netloc.lower()
-
-    delay = float(settings.get("delay", DEFAULT_DELAY))
-
-    last = HOST_TIMES.get(host, 0.0)
-
-    remaining = delay - (time.time() - last)
-
-    if remaining > 0:
-        time.sleep(remaining)
-
-    HOST_TIMES[host] = time.time()
-
-
-def robots_allowed(url, settings):
-
-    if not settings.get("respect_robots", True):
-        return True
-
-    parsed = urllib.parse.urlsplit(url)
-
-    host = parsed.netloc.lower()
-
-    if host not in ROBOTS_CACHE:
-
-        robots_url = (
-            parsed.scheme + "://" +
-            parsed.netloc +
-            "/robots.txt"
-        )
-
-        parser = urllib.robotparser.RobotFileParser()
-        parser.set_url(robots_url)
-
-        try:
-
-            request = urllib.request.Request(
-                robots_url,
-                headers={
-                    "User-Agent": settings.get("user_agent", USER_AGENT)
-                }
-            )
-
-            with urllib.request.urlopen(
-                request,
-                timeout=15
-            ) as response:
-
-                text = response.read(512 * 1024).decode(
-                    "utf-8",
-                    errors="replace"
+            relative = str(path.relative_to(root))
+            stat = path.stat()
+            digest = sha256_file(path)
+
+            row = db.execute(
+                """
+                SELECT id, size, sha256
+                FROM files
+                WHERE path=?
+                """,
+                (relative,),
+            ).fetchone()
+
+            if row:
+                db.execute(
+                    """
+                    UPDATE files
+                    SET size=?,
+                        sha256=?,
+                        verification_status=?,
+                        downloaded_at=COALESCE(downloaded_at, ?)
+                    WHERE id=?
+                    """,
+                    (
+                        stat.st_size,
+                        digest,
+                        "INVENTORIED",
+                        utc_now(),
+                        row["id"],
+                    ),
                 )
-
-            parser.parse(text.splitlines())
-
-            ROBOTS_CACHE[host] = parser
-
-        except Exception:
-
-            # An unavailable robots file does not mean that the
-            # website grants permission to access restricted content.
-            # It simply leaves the crawler without robots instructions.
-
-            ROBOTS_CACHE[host] = None
-
-    parser = ROBOTS_CACHE[host]
-
-    if parser is None:
-        return True
-
-    return parser.can_fetch(
-        settings.get("user_agent", USER_AGENT),
-        url
-    )
-
-
-def http_open(url, settings, method="GET", headers=None):
-
-    if not robots_allowed(url, settings):
-        raise PermissionError("Blocked by robots.txt")
-
-    wait_for_host(url, settings)
-
-    request_headers = {
-        "User-Agent": settings.get("user_agent", USER_AGENT),
-        "Accept": "*/*"
-    }
-
-    if headers:
-        request_headers.update(headers)
-
-    request = urllib.request.Request(
-        url,
-        headers=request_headers,
-        method=method
-    )
-
-    return urllib.request.urlopen(
-        request,
-        timeout=HTTP_TIMEOUT
-    )
-
-
-def get_page(url, settings):
-
-    with http_open(url, settings) as response:
-
-        content_type = response.headers.get(
-            "Content-Type", ""
-        ).lower()
-
-        if "html" not in content_type and "xml" not in content_type:
-
-            return (
-                response.status,
-                content_type,
-                b"",
-                response.headers
-            )
-
-        data = response.read(MAX_HTML_SIZE)
-
-        return (
-            response.status,
-            content_type,
-            data,
-            response.headers
-        )
-
-
-# ============================================================
-# HTML PARSING
-# ============================================================
-
-class PageParser(HTMLParser):
-
-    def __init__(self):
-
-        super().__init__()
-
-        self.links = []
-        self.script_urls = []
-
-    def handle_starttag(self, tag, attrs):
-
-        values = dict(attrs)
-
-        if tag.lower() in (
-            "a", "area", "iframe", "source", "embed"
-        ):
-
-            link = values.get("href") or values.get("src")
-
-            if link:
-                self.links.append(link)
-
-        if tag.lower() == "script":
-
-            source = values.get("src")
-
-            if source:
-                self.script_urls.append(source)
-
-
-def extract_urls_from_text(text):
-
-    patterns = [
-
-        r'https?://[^\s"\'<>\\]+',
-
-        r'(?:href|src)\s*=\s*["\']([^"\']+)["\']'
-
-    ]
-
-    found = []
-
-    for pattern in patterns:
-
-        for match in re.findall(pattern, text, re.I):
-
-            if isinstance(match, tuple):
-                match = match[0]
-
-            found.append(match)
-
-    return found
-
-
-def is_download_candidate(url):
-
-    extension = get_extension(url)
-
-    if extension in SUPPORTED_EXTENSIONS:
-        return True
-
-    lower = url.lower()
-
-    indicators = (
-        "/download",
-        "download=",
-        "/attachment",
-        "attachment=",
-        "/document/",
-        "/file/"
-    )
-
-    return any(
-        item in lower
-        for item in indicators
-    )
-
-
-# ============================================================
-# ITEM INDEX
-# ============================================================
-
-def add_item(db, url, source_id):
-
-    url = normalize_url(url)
-
-    if not url:
-        return
-
-    db.execute(
-        """
-        INSERT OR IGNORE INTO items
-        (url,discovered_at,last_seen,state)
-        VALUES(?,?,?,'DISCOVERED')
-        """,
-        (
-            url,
-            now(),
-            now()
-        )
-    )
-
-    db.execute(
-        """
-        UPDATE items
-        SET last_seen=?
-        WHERE url=?
-        """,
-        (now(), url)
-    )
-
-    db.execute(
-        """
-        INSERT OR IGNORE INTO item_sources
-        (url,source_id)
-        VALUES(?,?)
-        """,
-        (url, source_id)
-    )
-
-
-# ============================================================
-# GOOGLE DRIVE ADAPTER
-# ============================================================
-
-def discover_google_drive(db, source, settings):
-
-    sid, name, tier, url, adapter = source
-
-    parsed = urllib.parse.urlsplit(url)
-
-    match = re.search(
-        r"/folders/([A-Za-z0-9_-]+)",
-        parsed.path
-    )
-
-    if not match:
-
-        add_item(db, url, sid)
-        return 0, 1
-
-    folder_id = match.group(1)
-
-    embedded = (
-        "https://drive.google.com/embeddedfolderview"
-        "?id=" + folder_id + "#list"
-    )
-
-    say("  Google Drive folder: " + folder_id)
-
-    try:
-
-        status, content_type, data, headers = get_page(
-            embedded,
-            settings
-        )
-
-        text = data.decode(
-            "utf-8",
-            errors="replace"
-        )
-
-        parser = PageParser()
-        parser.feed(text)
-
-        identifiers = set()
-
-        patterns = [
-
-            r"/file/d/([A-Za-z0-9_-]{15,})",
-
-            r'"([A-Za-z0-9_-]{20,})"',
-
-            r"[?&]id=([A-Za-z0-9_-]{15,})"
-
-        ]
-
-        for pattern in patterns:
-
-            for item in re.findall(pattern, text):
-
-                if len(item) >= 15:
-                    identifiers.add(item)
-
-        for raw in parser.links:
-
-            link = urllib.parse.urljoin(
-                embedded,
-                raw
-            )
-
-            match = re.search(
-                r"/file/d/([A-Za-z0-9_-]+)",
-                link
-            )
-
-            if match:
-                identifiers.add(match.group(1))
-
-        count = 0
-
-        for file_id in identifiers:
-
-            download_url = (
-                "https://drive.google.com/uc"
-                "?export=download&id=" +
-                urllib.parse.quote(file_id)
-            )
-
-            add_item(
-                db,
-                download_url,
-                sid
-            )
+            else:
+                db.execute(
+                    """
+                    INSERT INTO files
+                    (
+                        path,
+                        filename,
+                        size,
+                        sha256,
+                        downloaded_at,
+                        verification_status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        relative,
+                        path.name,
+                        stat.st_size,
+                        digest,
+                        utc_now(),
+                        "INVENTORIED",
+                    ),
+                )
 
             count += 1
 
-        # Keep the original folder reference in the registry.
-
-        db.commit()
-
-        return 1, count
-
-    except Exception as error:
-
-        log_event(
-            db,
-            "WARN",
-            "GOOGLE_DRIVE_DISCOVERY",
-            url,
-            str(error)
-        )
-
-        return 0, 0
-
-
-# ============================================================
-# DROPBOX ADAPTER
-# ============================================================
-
-def discover_dropbox(db, source, settings):
-
-    sid, name, tier, url, adapter = source
-
-    parsed = urllib.parse.urlsplit(url)
-
-    query = urllib.parse.parse_qs(parsed.query)
-
-    query["dl"] = ["1"]
-
-    direct = urllib.parse.urlunsplit(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            urllib.parse.urlencode(query, doseq=True),
-            ""
-        )
-    )
-
-    add_item(
-        db,
-        direct,
-        sid
-    )
-
-    return 0, 1
-
-
-# ============================================================
-# INTERNET ARCHIVE ADAPTER
-# ============================================================
-
-def discover_internet_archive(db, source, settings):
-
-    sid, name, tier, url, adapter = source
-
-    query = settings.get(
-        "internet_archive_query",
-        'title:(Epstein) AND mediatype:(texts)'
-    )
-
-    rows = int(
-        settings.get(
-            "internet_archive_rows",
-            300
-        )
-    )
-
-    api = "https://archive.org/advancedsearch.php"
-
-    params = {
-        "q": query,
-        "fl[]": ["identifier", "title"],
-        "rows": str(rows),
-        "page": "1",
-        "output": "json"
-    }
-
-    search_url = api + "?" + urllib.parse.urlencode(
-        params,
-        doseq=True
-    )
-
-    try:
-
-        with http_open(search_url, settings) as response:
-
-            payload = json.loads(
-                response.read().decode("utf-8")
-            )
-
-        documents = payload.get(
-            "response", {}
-        ).get("docs", [])
-
-        found = 0
-
-        for document in documents:
-
-            identifier = document.get("identifier")
-
-            if not identifier:
-                continue
-
-            metadata_url = (
-                "https://archive.org/metadata/" +
-                urllib.parse.quote(identifier)
-            )
-
-            try:
-
-                with http_open(
-                    metadata_url,
-                    settings
-                ) as response:
-
-                    metadata = json.loads(
-                        response.read().decode("utf-8")
-                    )
-
-                files = metadata.get("files", [])
-
-                for item in files:
-
-                    filename = item.get("name", "")
-
-                    extension = Path(filename).suffix.lower()
-
-                    if extension not in SUPPORTED_EXTENSIONS:
-                        continue
-
-                    if filename.startswith("__MACOSX/"):
-                        continue
-
-                    file_url = (
-                        "https://archive.org/download/" +
-                        urllib.parse.quote(identifier) +
-                        "/" +
-                        urllib.parse.quote(filename)
-                    )
-
-                    add_item(
-                        db,
-                        file_url,
-                        sid
-                    )
-
-                    found += 1
-
-            except Exception as error:
-
-                log_event(
-                    db,
-                    "WARN",
-                    "IA_METADATA_ERROR",
-                    metadata_url,
-                    str(error)
-                )
-
-        db.commit()
-
-        return len(documents), found
-
-    except Exception as error:
-
-        log_event(
-            db,
-            "ERROR",
-            "IA_SEARCH_ERROR",
-            search_url,
-            str(error)
-        )
-
-        return 0, 0
-
-
-# ============================================================
-# GENERIC HTML DISCOVERY
-# ============================================================
-
-def crawl_html_source(db, source, settings):
-
-    sid, name, tier, start_url, adapter = source
-
-    start_url = normalize_url(start_url)
-
-    if not start_url:
-        return 0, 0
-
-    base_host = urllib.parse.urlsplit(
-        start_url
-    ).netloc.lower()
-
-    depth_limit = min(
-        5,
-        max(
-            0,
-            int(settings.get("crawl_depth", DEFAULT_CRAWL_DEPTH))
-        )
-    )
-
-    page_limit = int(
-        settings.get("page_limit", DEFAULT_PAGE_LIMIT)
-    )
-
-    queue = [(start_url, 0)]
-
-    visited = set()
-    candidate_files = set()
-
-    # Add sitemap as another discovery starting point.
-
-    parsed = urllib.parse.urlsplit(start_url)
-
-    sitemap = (
-        parsed.scheme +
-        "://" +
-        parsed.netloc +
-        "/sitemap.xml"
-    )
-
-    queue.append((sitemap, 0))
-
-    while queue:
-
-        url, depth = queue.pop(0)
-
-        url = normalize_url(url)
-
-        if not url:
-            continue
-
-        if url in visited:
-            continue
-
-        if page_limit > 0 and len(visited) >= page_limit:
-            break
-
-        visited.add(url)
-
-        if not robots_allowed(url, settings):
-            continue
-
-        try:
-
-            status, content_type, data, headers = get_page(
-                url,
-                settings
-            )
-
-            if not data:
-                continue
-
-            text = data.decode(
-                "utf-8",
-                errors="replace"
-            )
-
-            parser = PageParser()
-
-            parser.feed(text)
-
-            db.execute(
-                """
-                INSERT OR REPLACE INTO pages
-                (url,source_id,status_code,last_checked,error)
-                VALUES(?,?,?,?,NULL)
-                """,
-                (
-                    url,
-                    sid,
-                    status,
-                    now()
-                )
-            )
-
-            links = list(parser.links)
-
-            # URLs embedded in page source.
-            links.extend(
-                extract_urls_from_text(text)
-            )
-
-            # JavaScript files are not executed.
-            # Their source may contain API paths and document URLs.
-
-            for script in parser.script_urls[:30]:
-
-                script_url = urllib.parse.urljoin(
-                    url,
-                    script
-                )
-
-                try:
-
-                    with http_open(
-                        script_url,
-                        settings
-                    ) as response:
-
-                        script_text = response.read(
-                            2 * 1024 * 1024
-                        ).decode(
-                            "utf-8",
-                            errors="replace"
-                        )
-
-                    links.extend(
-                        extract_urls_from_text(script_text)
-                    )
-
-                except Exception:
-                    pass
-
-            for raw in links:
-
-                link = urllib.parse.urljoin(
-                    url,
-                    html.unescape(raw)
-                )
-
-                link = normalize_url(link)
-
-                if not link:
-                    continue
-
-                if is_download_candidate(link):
-
-                    candidate_files.add(link)
-                    continue
-
-                link_host = urllib.parse.urlsplit(
-                    link
-                ).netloc.lower()
-
-                if (
-                    link_host == base_host
-                    and depth < depth_limit
-                ):
-
-                    queue.append(
-                        (link, depth + 1)
-                    )
-
-        except urllib.error.HTTPError as error:
-
-            db.execute(
-                """
-                INSERT OR REPLACE INTO pages
-                (url,source_id,status_code,last_checked,error)
-                VALUES(?,?,?,?,?)
-                """,
-                (
-                    url,
-                    sid,
-                    error.code,
-                    now(),
-                    str(error)
-                )
-            )
-
-            level = (
-                "CRITICAL"
-                if error.code in CRITICAL_HTTP_CODES
-                else "WARN"
-            )
-
-            log_event(
-                db,
-                level,
-                "DISCOVERY_HTTP_ERROR",
-                url,
-                str(error)
-            )
-
-        except Exception as error:
-
-            log_event(
-                db,
-                "WARN",
-                "DISCOVERY_ERROR",
-                url,
-                str(error)
-            )
-
-        db.commit()
-
-    for link in candidate_files:
-
-        add_item(
-            db,
-            link,
-            sid
-        )
+            if count % 25 == 0:
+                db.commit()
+                log("info", f"Inventoried {count} files")
+
+        except Exception as exc:
+            log("error", f"Inventory failed: {path}: {exc}")
 
     db.commit()
 
-    return len(visited), len(candidate_files)
+    print("Files inventoried:", count)
 
 
-# ============================================================
-# DISCOVERY DISPATCHER
-# ============================================================
+def verify_inventory(root: Path, db):
+    print("\n[VERIFY] Existing archive")
 
-def discover_source(db, source, settings):
-
-    adapter = source[4]
-
-    if adapter == "google_drive":
-
-        return discover_google_drive(
-            db,
-            source,
-            settings
-        )
-
-    if adapter == "dropbox":
-
-        return discover_dropbox(
-            db,
-            source,
-            settings
-        )
-
-    if adapter == "internet_archive":
-
-        return discover_internet_archive(
-            db,
-            source,
-            settings
-        )
-
-    return crawl_html_source(
-        db,
-        source,
-        settings
-    )
-
-
-def discover_all(db, settings):
-
-    say("\nDISCOVERY")
-
-    sources = db.execute(
-        """
-        SELECT source_id,name,tier,url,adapter
-        FROM sources
-        WHERE active=1
-        ORDER BY tier,name
-        """
+    rows = db.execute(
+        "SELECT * FROM files ORDER BY path"
     ).fetchall()
 
-    total_pages = 0
-    total_files = 0
-
-    for index, source in enumerate(sources, 1):
-
-        sid, name, tier, url, adapter = source
-
-        say(
-            "\n[%d/%d] %s" %
-            (index, len(sources), name)
-        )
-
-        pages, files = discover_source(
-            db,
-            source,
-            settings
-        )
-
-        total_pages += pages
-        total_files += files
-
-        db.execute(
-            """
-            UPDATE sources
-            SET last_checked=?,status='CHECKED'
-            WHERE source_id=?
-            """,
-            (now(), sid)
-        )
-
-        db.commit()
-
-        say(
-            "  Pages: %d | candidate files: %d" %
-            (pages, files)
-        )
-
-    say("\nDISCOVERY TOTALS")
-
-    say("  Pages: " + str(total_pages))
-    say("  Candidate URLs: " + str(total_files))
-
-
-# ============================================================
-# NETWORK PROBES
-# ============================================================
-
-def probe_url(url, settings):
-
-    try:
-
-        with http_open(
-            url,
-            settings,
-            method="HEAD"
-        ) as response:
-
-            return (
-                response.status,
-                response.headers.get("Content-Type", ""),
-                int(response.headers.get("Content-Length") or 0),
-                response.headers.get("ETag"),
-                response.headers.get("Last-Modified"),
-                response.headers.get("Content-Disposition"),
-                None
-            )
-
-    except urllib.error.HTTPError as error:
-
-        if error.code not in (400, 403, 405, 501):
-
-            return (
-                error.code,
-                "",
-                0,
-                None,
-                None,
-                None,
-                str(error)
-            )
-
-    except Exception:
-        pass
-
-    # Range request fallback for servers that reject HEAD.
-
-    try:
-
-        with http_open(
-            url,
-            settings,
-            headers={
-                "Range": "bytes=0-0"
-            }
-        ) as response:
-
-            return (
-                response.status,
-                response.headers.get("Content-Type", ""),
-                int(response.headers.get("Content-Length") or 0),
-                response.headers.get("ETag"),
-                response.headers.get("Last-Modified"),
-                response.headers.get("Content-Disposition"),
-                None
-            )
-
-    except urllib.error.HTTPError as error:
-
-        return (
-            error.code,
-            "",
-            0,
-            None,
-            None,
-            None,
-            str(error)
-        )
-
-    except Exception as error:
-
-        return (
-            0,
-            "",
-            0,
-            None,
-            None,
-            None,
-            str(error)
-        )
-
-
-def probe_all(db, settings):
-
-    say("\nNETWORK PROBES")
-
-    items = db.execute(
-        """
-        SELECT url
-        FROM items
-        ORDER BY url
-        """
-    ).fetchall()
-
-    for index, (url,) in enumerate(items, 1):
-
-        (
-            status,
-            content_type,
-            size,
-            etag,
-            modified,
-            disposition,
-            error
-        ) = probe_url(
-            url,
-            settings
-        )
-
-        if status in (200, 206):
-            state = "READY"
-
-        elif status in CRITICAL_HTTP_CODES:
-            state = "CRITICAL"
-
-        else:
-            state = "ERROR"
-
-        filename = parse_content_disposition(
-            disposition
-        )
-
-        db.execute(
-            """
-            UPDATE items
-
-            SET status_code=?,
-                content_type=?,
-                size_hint=?,
-                etag=?,
-                last_modified=?,
-                filename=COALESCE(?,filename),
-                last_seen=?,
-                state=?,
-                error=?
-
-            WHERE url=?
-            """,
-            (
-                status or None,
-                content_type,
-                size or None,
-                etag,
-                modified,
-                filename,
-                now(),
-                state,
-                error,
-                url
-            )
-        )
-
-        if state != "READY":
-
-            log_event(
-                db,
-                state,
-                "NETWORK_PROBE",
-                url,
-                "HTTP %s: %s" % (status, error or "")
-            )
-
-        if index % 25 == 0:
-
-            db.commit()
-
-            say(
-                "  %d / %d" %
-                (index, len(items))
-            )
-
-    db.commit()
-
-    say("Probe pass complete.")
-
-
-# ============================================================
-# FILE DESTINATION
-# ============================================================
-
-def destination_folder(root, tier, source_id):
-
-    if tier == "OFFICIAL":
-
-        if source_id.startswith("fbi"):
-            folder = "01_RAW_OFFICIAL/FBI"
-
-        elif source_id.startswith("cbp"):
-            folder = "01_RAW_OFFICIAL/CBP"
-
-        elif source_id.startswith("house"):
-            folder = "01_RAW_OFFICIAL/HOUSE_OVERSIGHT"
-
-        elif source_id.startswith("senate"):
-            folder = "01_RAW_OFFICIAL/SENATE_FINANCE"
-
-        elif source_id.startswith("florida"):
-            folder = "01_RAW_OFFICIAL/FLORIDA"
-
-        elif source_id.startswith("usvi"):
-            folder = "01_RAW_OFFICIAL/US_VIRGIN_ISLANDS"
-
-        elif source_id.startswith("doj_oig"):
-            folder = "01_RAW_OFFICIAL/DOJ_OIG"
-
-        elif source_id.startswith("doj_opr"):
-            folder = "01_RAW_OFFICIAL/DOJ_OPR"
-
-        elif source_id.startswith("bop"):
-            folder = "01_RAW_OFFICIAL/BOP"
-
-        elif source_id.startswith("bush"):
-            folder = "01_RAW_OFFICIAL/PRESIDENTIAL_LIBRARIES"
-
-        elif source_id.startswith("sec"):
-            folder = "01_RAW_OFFICIAL/SEC"
-
-        else:
-            folder = "01_RAW_OFFICIAL/DOJ"
-
-    elif tier == "COMMUNITY":
-
-        folder = "04_COMMUNITY_RESEARCH/FORUMS"
-
-    elif source_id == "internet_archive":
-
-        folder = "03_SECONDARY_ARCHIVES/INTERNET_ARCHIVE"
-
-    elif source_id == "courtlistener":
-
-        folder = "03_SECONDARY_ARCHIVES/COURTLISTENER"
-
-    elif source_id == "google_pinpoint":
-
-        folder = "03_SECONDARY_ARCHIVES/GOOGLE_PINPOINT"
-
-    elif source_id == "epstein_project":
-
-        folder = "03_SECONDARY_ARCHIVES/EPSTEIN_PROJECT"
-
-    elif source_id == "epstein_exposed":
-
-        folder = "03_SECONDARY_ARCHIVES/EPSTEIN_EXPOSED"
-
-    else:
-
-        folder = "03_SECONDARY_ARCHIVES/OTHER_MIRRORS"
-
-    result = root / folder / safe_name(source_id)
-
-    result.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    return result
-
-
-# ============================================================
-# DEDUPLICATION
-# ============================================================
-
-def find_existing_hash(db, digest):
-
-    return db.execute(
-        """
-        SELECT local_path
-        FROM files
-        WHERE baseline_sha256=?
-          AND state='VERIFIED'
-        LIMIT 1
-        """,
-        (digest,)
-    ).fetchone()
-
-
-def register_file(
-    db,
-    relative_path,
-    size,
-    digest,
-    source_url
-):
-
-    path = Path(relative_path)
-
-    absolute = path
-
-    try:
-        stat = absolute.stat()
-        mtime_ns = stat.st_mtime_ns
-    except OSError:
-        mtime_ns = None
-
-    db.execute(
-        """
-        INSERT OR REPLACE INTO files
-        (
-            local_path,
-            size,
-            mtime_ns,
-            baseline_sha256,
-            observed_sha256,
-            verified_at,
-            state,
-            source_url
-        )
-        VALUES(?,?,?,?,?,?,?,?)
-        """,
-        (
-            str(relative_path),
-            size,
-            mtime_ns,
-            digest,
-            digest,
-            now(),
-            "VERIFIED",
-            source_url
-        )
-    )
-
-
-# ============================================================
-# DOWNLOAD ENGINE
-# ============================================================
-
-def download_item(db, root, row, settings):
-
-    url, source_id, tier, size_hint, old_path = row
-
-    extension = get_extension(url)
-
-    if (
-        extension in MEDIA_EXTENSIONS
-        and not settings.get("include_media", False)
-    ):
-
-        db.execute(
-            """
-            UPDATE items
-            SET state='HOLD_MEDIA',
-                error='Media requires manual review'
-            WHERE url=?
-            """,
-            (url,)
-        )
-
-        db.commit()
-
-        return "held"
-
-    folder = destination_folder(
-        root,
-        tier or "SECONDARY",
-        source_id or "unknown"
-    )
-
-    staging = root / "99_STAGING" / "DOWNLOADING"
-
-    staging.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    key = url_hash(url)
-
-    partial = staging / (key + ".part")
-
-    offset = partial.stat().st_size if partial.exists() else 0
-
-    headers = {}
-
-    if offset:
-        headers["Range"] = "bytes=%d-" % offset
-
-    retries = int(
-        settings.get("retries", DEFAULT_RETRIES)
-    )
-
-    last_error = None
-
-    for attempt in range(retries):
-
-        try:
-
-            with http_open(
-                url,
-                settings,
-                headers=headers
-            ) as response:
-
-                status = response.status
-
-                if offset and status != 206:
-
-                    partial.unlink(missing_ok=True)
-                    offset = 0
-                    headers = {}
-
-                    continue
-
-                if offset and status == 206:
-
-                    content_range = response.headers.get(
-                        "Content-Range",
-                        ""
-                    )
-
-                    match = re.match(
-                        r"bytes\s+(\d+)-",
-                        content_range
-                    )
-
-                    if match and int(match.group(1)) != offset:
-
-                        partial.unlink(missing_ok=True)
-                        offset = 0
-                        headers = {}
-
-                        continue
-
-                mode = "ab" if offset else "wb"
-
-                digest = hashlib.sha256()
-
-                if offset:
-
-                    with open(partial, "rb") as old:
-
-                        while True:
-
-                            block = old.read(BLOCK_SIZE)
-
-                            if not block:
-                                break
-
-                            digest.update(block)
-
-                with open(partial, mode) as output:
-
-                    while True:
-
-                        block = response.read(BLOCK_SIZE)
-
-                        if not block:
-                            break
-
-                        output.write(block)
-
-                        digest.update(block)
-
-                checksum = digest.hexdigest()
-
-                actual_size = partial.stat().st_size
-
-                # Detect a server returning HTML instead of a file.
-
-                content_type = response.headers.get(
-                    "Content-Type",
-                    ""
-                ).lower()
-
-                with open(partial, "rb") as check:
-
-                    first_bytes = check.read(512).lstrip().lower()
-
-                looks_like_html = (
-                    first_bytes.startswith(b"<!doctype html")
-                    or first_bytes.startswith(b"<html")
-                    or first_bytes.startswith(b"<head")
-                )
-
-                if (
-                    looks_like_html
-                    and extension in SUPPORTED_EXTENSIONS
-                    and extension not in (".html", ".htm")
-                ):
-
-                    quarantine = (
-                        root / "99_STAGING" /
-                        "QUARANTINE" /
-                        (key + ".html")
-                    )
-
-                    quarantine.parent.mkdir(
-                        parents=True,
-                        exist_ok=True
-                    )
-
-                    os.replace(
-                        partial,
-                        quarantine
-                    )
-
-                    db.execute(
-                        """
-                        UPDATE items
-                        SET state='QUARANTINED',
-                            error='HTML returned instead of expected file'
-                        WHERE url=?
-                        """,
-                        (url,)
-                    )
-
-                    db.commit()
-
-                    log_event(
-                        db,
-                        "WARN",
-                        "HTML_INSTEAD_OF_FILE",
-                        url,
-                        str(quarantine)
-                    )
-
-                    return "error"
-
-                # Duplicate content check.
-
-                duplicate = find_existing_hash(
-                    db,
-                    checksum
-                )
-
-                if duplicate:
-
-                    existing_relative = duplicate[0]
-                    existing_path = root / existing_relative
-
-                    if existing_path.exists():
-
-                        partial.unlink(missing_ok=True)
-
-                        db.execute(
-                            """
-                            UPDATE items
-                            SET local_path=?,
-                                sha256=?,
-                                size_hint=?,
-                                state='DUPLICATE',
-                                error=NULL
-                            WHERE url=?
-                            """,
-                            (
-                                existing_relative,
-                                checksum,
-                                actual_size,
-                                url
-                            )
-                        )
-
-                        db.commit()
-
-                        log_event(
-                            db,
-                            "INFO",
-                            "DUPLICATE",
-                            url,
-                            existing_relative
-                        )
-
-                        return "duplicate"
-
-                # Name priority:
-                # Content-Disposition > existing filename > URL path.
-
-                filename = parse_content_disposition(
-                    response.headers.get("Content-Disposition")
-                )
-
-                if not filename:
-
-                    row_name = db.execute(
-                        "SELECT filename FROM items WHERE url=?",
-                        (url,)
-                    ).fetchone()
-
-                    if row_name and row_name[0]:
-                        filename = safe_name(row_name[0])
-                    else:
-                        filename = filename_from_url(url)
-
-                destination = folder / filename
-
-                if destination.exists():
-
-                    suffix = checksum[:12]
-
-                    destination = folder / (
-                        destination.stem +
-                        "_" +
-                        suffix +
-                        destination.suffix
-                    )
-
-                os.replace(
-                    partial,
-                    destination
-                )
-
-                relative = str(
-                    destination.relative_to(root)
-                )
-
-                db.execute(
-                    """
-                    UPDATE items
-
-                    SET local_path=?,
-                        sha256=?,
-                        size_hint=?,
-                        content_type=?,
-                        filename=?,
-                        state='DOWNLOADED',
-                        last_seen=?,
-                        error=NULL
-
-                    WHERE url=?
-                    """,
-                    (
-                        relative,
-                        checksum,
-                        actual_size,
-                        content_type,
-                        destination.name,
-                        now(),
-                        url
-                    )
-                )
-
-                db.commit()
-
-                stat = destination.stat()
-
-                db.execute(
-                    """
-                    INSERT OR REPLACE INTO files
-                    (
-                        local_path,
-                        size,
-                        mtime_ns,
-                        baseline_sha256,
-                        observed_sha256,
-                        verified_at,
-                        state,
-                        source_url
-                    )
-                    VALUES(?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        relative,
-                        actual_size,
-                        stat.st_mtime_ns,
-                        checksum,
-                        checksum,
-                        now(),
-                        "VERIFIED",
-                        url
-                    )
-                )
-
-                db.commit()
-
-                log_event(
-                    db,
-                    "INFO",
-                    "DOWNLOAD_OK",
-                    url,
-                    "%s | %s | SHA256=%s" %
-                    (
-                        relative,
-                        human_size(actual_size),
-                        checksum
-                    )
-                )
-
-                return "downloaded"
-
-        except urllib.error.HTTPError as error:
-
-            last_error = "HTTP %d: %s" % (
-                error.code,
-                error
-            )
-
-            if error.code in CRITICAL_HTTP_CODES:
-
-                db.execute(
-                    """
-                    UPDATE items
-                    SET status_code=?,
-                        state='CRITICAL',
-                        last_seen=?,
-                        error=?
-                    WHERE url=?
-                    """,
-                    (
-                        error.code,
-                        now(),
-                        last_error,
-                        url
-                    )
-                )
-
-                db.commit()
-
-                log_event(
-                    db,
-                    "CRITICAL",
-                    "DOWNLOAD_HTTP_ERROR",
-                    url,
-                    last_error
-                )
-
-                return "critical"
-
-        except Exception as error:
-
-            last_error = repr(error)
-
-        time.sleep(
-            1 + attempt * 2
-        )
-
-    db.execute(
-        """
-        UPDATE items
-        SET state='ERROR',
-            last_seen=?,
-            error=?
-        WHERE url=?
-        """,
-        (
-            now(),
-            last_error,
-            url
-        )
-    )
-
-    db.commit()
-
-    log_event(
-        db,
-        "ERROR",
-        "DOWNLOAD_FAILED",
-        url,
-        last_error or "Unknown error"
-    )
-
-    return "error"
-
-
-# ============================================================
-# DISK / FILE HEALTH
-# ============================================================
-
-def mount_point(path):
-
-    current = Path(path).resolve()
-
-    while current.parent != current:
-
-        if os.path.ismount(str(current)):
-            return current
-
-        current = current.parent
-
-    return current
-
-
-def disk_report(root):
-
-    usage = shutil.disk_usage(
-        str(root)
-    )
-
-    mount = mount_point(root)
-
-    say("\nDISK SPACE")
-
-    say("  Mount: " + str(mount))
-    say("  Total: " + human_size(usage.total))
-    say("  Used:  " + human_size(usage.used))
-    say("  Free:  " + human_size(usage.free))
-
-    try:
-
-        entries = list(mount.iterdir())
-
-        directories = [
-            entry.name for entry in entries
-            if entry.is_dir()
-        ]
-
-        say(
-            "  Directories at mount level: %d" %
-            len(directories)
-        )
-
-    except Exception as error:
-
-        say("  Directory listing failed: " + str(error))
-
-    return usage
-
-
-def smart_report(root, explicit_device=None):
-
-    say("\nSMART HEALTH")
-
-    say("  No filesystem repair will be run.")
-
-    smartctl = shutil.which("smartctl")
-
-    if not smartctl:
-
-        say("  smartctl not installed.")
-        say("  Install smartmontools for SMART information.")
-
-        return
-
-    device = explicit_device
-
-    if not device:
-
-        system = platform.system().lower()
-
-        try:
-
-            if system == "linux" and shutil.which("findmnt"):
-
-                device = subprocess.check_output(
-                    [
-                        "findmnt",
-                        "-no",
-                        "SOURCE",
-                        "--target",
-                        str(root)
-                    ],
-                    text=True,
-                    stderr=subprocess.DEVNULL
-                ).strip()
-
-            elif system == "darwin" and shutil.which("df"):
-
-                line = subprocess.check_output(
-                    ["df", str(root)],
-                    text=True,
-                    stderr=subprocess.DEVNULL
-                ).splitlines()[-1]
-
-                device = line.split()[0]
-
-        except Exception:
-
-            device = None
-
-    if not device:
-
-        say("  Device not identified; SMART skipped.")
-        return
-
-    say("  Device: " + device)
-
-    try:
-
-        result = subprocess.run(
-            [
-                smartctl,
-                "-H",
-                device
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=30
-        )
-
-        for line in result.stdout.splitlines()[:25]:
-            say("  " + line)
-
-    except Exception as error:
-
-        say("  SMART error: " + str(error))
-
-
-def quick_write_test(root):
-
-    directory = root / "99_STAGING"
-
-    directory.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    path = directory / ".write_test"
-
-    try:
-
-        with open(path, "wb") as output:
-            output.write(b"ARCHIVE_WRITE_TEST")
-            output.flush()
-            os.fsync(output.fileno())
-
-        path.unlink(missing_ok=True)
-
-        say("  Write test: OK")
-
-    except Exception as error:
-
-        say("  Write test failed: " + str(error))
-
-
-# ============================================================
-# VERIFY FILES
-# ============================================================
-
-def verify_local_files(db, root):
-
-    say("\nLOCAL FILE VERIFICATION")
-
-    checked = 0
-    new_files = 0
-    changed = 0
     missing = 0
-    errors = 0
+    changed = 0
+    verified = 0
+    duplicates = 0
 
-    known = {
-        row[0]: row[1]
-        for row in db.execute(
-            """
-            SELECT local_path,baseline_sha256
-            FROM files
-            """
-        ).fetchall()
-    }
+    hash_groups = {}
 
-    seen = set()
+    for row in rows:
 
-    for directory in DATA_DIRECTORIES:
+        path = root / row["path"]
 
-        base_directory = root / directory
-
-        if not base_directory.exists():
-            continue
-
-        for base, dirs, files in os.walk(
-            base_directory,
-            followlinks=False
-        ):
-
-            dirs[:] = [
-                name for name in dirs
-                if name not in IGNORE_SCAN_DIRECTORIES
-            ]
-
-            for filename in files:
-
-                if filename.endswith(".part"):
-                    continue
-
-                path = Path(base) / filename
-
-                try:
-
-                    if not path.is_file():
-                        continue
-
-                    relative = str(
-                        path.relative_to(root)
-                    )
-
-                    seen.add(relative)
-
-                    stat = path.stat()
-
-                    digest = file_sha256(path)
-
-                    previous = known.get(relative)
-
-                    if previous is None:
-
-                        state = "NEW"
-                        new_files += 1
-
-                        db.execute(
-                            """
-                            INSERT OR REPLACE INTO files
-                            (
-                                local_path,
-                                size,
-                                mtime_ns,
-                                baseline_sha256,
-                                observed_sha256,
-                                verified_at,
-                                state
-                            )
-                            VALUES(?,?,?,?,?,?,?)
-                            """,
-                            (
-                                relative,
-                                stat.st_size,
-                                stat.st_mtime_ns,
-                                digest,
-                                digest,
-                                now(),
-                                state
-                            )
-                        )
-
-                    elif digest != previous:
-
-                        state = "CORRUPT"
-                        changed += 1
-
-                        # The original baseline is preserved.
-                        # Do not overwrite it with a changed checksum.
-
-                        db.execute(
-                            """
-                            UPDATE files
-                            SET observed_sha256=?,
-                                verified_at=?,
-                                state=?
-                            WHERE local_path=?
-                            """,
-                            (
-                                digest,
-                                now(),
-                                state,
-                                relative
-                            )
-                        )
-
-                        log_event(
-                            db,
-                            "CRITICAL",
-                            "CHECKSUM_MISMATCH",
-                            "",
-                            relative
-                        )
-
-                    else:
-
-                        state = "VERIFIED"
-
-                        db.execute(
-                            """
-                            UPDATE files
-                            SET observed_sha256=?,
-                                verified_at=?,
-                                state=?,
-                                size=?,
-                                mtime_ns=?
-                            WHERE local_path=?
-                            """,
-                            (
-                                digest,
-                                now(),
-                                state,
-                                stat.st_size,
-                                stat.st_mtime_ns,
-                                relative
-                            )
-                        )
-
-                    checked += 1
-
-                except Exception as error:
-
-                    errors += 1
-
-                    log_event(
-                        db,
-                        "ERROR",
-                        "FILE_READ_ERROR",
-                        str(path),
-                        str(error)
-                    )
-
-        db.commit()
-
-    for relative in known:
-
-        if relative not in seen:
-
+        if not path.exists():
             missing += 1
 
             db.execute(
                 """
                 UPDATE files
-                SET state='MISSING',
-                    verified_at=?
-                WHERE local_path=?
+                SET verification_status='MISSING'
+                WHERE id=?
                 """,
-                (
-                    now(),
-                    relative
+                (row["id"],),
+            )
+
+            log("warning", f"MISSING: {row['path']}")
+            continue
+
+        try:
+            actual_size = path.stat().st_size
+            actual_hash = sha256_file(path)
+
+            if (
+                actual_size != row["size"]
+                or actual_hash != row["sha256"]
+            ):
+                changed += 1
+
+                db.execute(
+                    """
+                    UPDATE files
+                    SET verification_status='CHANGED'
+                    WHERE id=?
+                    """,
+                    (row["id"],),
                 )
+
+                log("warning", f"CHANGED: {row['path']}")
+
+            else:
+                verified += 1
+
+                db.execute(
+                    """
+                    UPDATE files
+                    SET verification_status='VERIFIED'
+                    WHERE id=?
+                    """,
+                    (row["id"],),
+                )
+
+            if actual_hash:
+                hash_groups.setdefault(actual_hash, []).append(row["id"])
+
+        except Exception as exc:
+            log("error", f"Verify failed: {path}: {exc}")
+
+    # Duplicate detection does not delete files.
+    for digest, ids in hash_groups.items():
+
+        if len(ids) < 2:
+            continue
+
+        duplicates += len(ids) - 1
+        group_id = digest[:16]
+
+        for file_id in ids:
+            db.execute(
+                """
+                UPDATE files
+                SET duplicate_group=?
+                WHERE id=?
+                """,
+                (group_id, file_id),
             )
 
     db.commit()
 
-    say("  Checked:   " + str(checked))
-    say("  New:       " + str(new_files))
-    say("  Changed:   " + str(changed))
-    say("  Missing:   " + str(missing))
-    say("  Errors:    " + str(errors))
+    print("\nVERIFICATION SUMMARY")
+    print("-" * 50)
+    print("Verified:   ", verified)
+    print("Missing:    ", missing)
+    print("Changed:    ", changed)
+    print("Duplicates: ", duplicates)
 
-    return {
-        "checked": checked,
-        "new": new_files,
-        "changed": changed,
-        "missing": missing,
-        "errors": errors
-    }
+    event(
+        db,
+        "INFO",
+        "VERIFY",
+        json.dumps({
+            "verified": verified,
+            "missing": missing,
+            "changed": changed,
+            "duplicates": duplicates,
+        }),
+    )
 
 
-def rebaseline_file(db, root):
+# ============================================================
+# DOWNLOAD PATHS
+# ============================================================
 
-    rows = db.execute(
+def source_folder(row):
+    return candidate_directory(
+        row["source_type"] or "secondary"
+    )
+
+
+def unique_path(directory: Path, filename: str, url: str):
+    directory.mkdir(parents=True, exist_ok=True)
+
+    candidate = directory / safe_filename(filename)
+
+    if not candidate.exists():
+        return candidate
+
+    suffix = hashlib.sha256(
+        url.encode("utf-8")
+    ).hexdigest()[:10]
+
+    stem = candidate.stem
+    ext = candidate.suffix
+
+    return directory / f"{stem}_{suffix}{ext}"
+
+
+def filename_from_headers(headers, url):
+    disposition = headers.get("Content-Disposition")
+
+    if disposition:
+        message = Message()
+        message["Content-Disposition"] = disposition
+
+        filename = message.get_filename()
+
+        if filename:
+            return safe_filename(filename)
+
+    return filename_from_url(url)
+
+
+# ============================================================
+# RESUMABLE DOWNLOAD
+# ============================================================
+
+def download_one(root: Path, db, row):
+    url = row["url"]
+
+    if row["manual_review"]:
+        log("warning", f"Manual review required; skipped: {url}")
+        return False
+
+    if not row["download_enabled"]:
+        log("info", f"Automatic download disabled: {url}")
+        return False
+
+    folder = root / source_folder(row)
+
+    filename = row["filename"] or filename_from_url(url)
+
+    destination = unique_path(
+        folder,
+        filename,
+        url,
+    )
+
+    # If a record already exists for this URL and its file is present,
+    # verify it instead of downloading another copy.
+
+    existing = db.execute(
         """
-        SELECT local_path,state
+        SELECT *
         FROM files
-        WHERE state='CORRUPT'
-        """
-    ).fetchall()
+        WHERE url=?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (url,),
+    ).fetchone()
 
-    if not rows:
+    if existing:
+        existing_path = root / existing["path"]
 
-        say("No changed files.")
-        return
+        if existing_path.exists():
+            try:
+                current_hash = sha256_file(existing_path)
 
-    say("\nCHANGED FILES")
+                if current_hash == existing["sha256"]:
+                    log("info", f"Already verified: {existing['path']}")
+                    return True
 
-    for index, row in enumerate(rows, 1):
+            except Exception:
+                pass
 
-        say(
-            "%d. %s [%s]" %
-            (index, row[0], row[1])
+    part = destination.with_name(destination.name + ".part")
+
+    headers = {}
+
+    offset = part.stat().st_size if part.exists() else 0
+
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+
+    log("info", f"DOWNLOAD: {url}")
+
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                **headers,
+            },
         )
 
-    answer = input(
-        "\nRecalculate and replace old baselines? [y/N] "
-    ).strip().lower()
+        response = urllib.request.urlopen(
+            request,
+            timeout=DOWNLOAD_TIMEOUT,
+        )
 
-    if answer not in ("y", "yes", "да", "д"):
-        return
+        status = response.getcode()
 
-    for relative, state in rows:
+        # If the server ignores Range and returns a full response,
+        # restart from zero instead of appending duplicate bytes.
 
-        path = root / relative
+        if offset and status != 206:
+            response.close()
+            offset = 0
+            part.unlink(missing_ok=True)
 
-        if not path.exists():
-            continue
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": USER_AGENT},
+            )
 
-        digest = file_sha256(path)
+            response = urllib.request.urlopen(
+                request,
+                timeout=DOWNLOAD_TIMEOUT,
+            )
 
-        stat = path.stat()
+        headers_obj = response.headers
+
+        filename = filename_from_headers(
+            headers_obj,
+            url,
+        )
+
+        if filename != destination.name:
+            new_destination = unique_path(
+                folder,
+                filename,
+                url,
+            )
+
+            destination = new_destination
+            part = destination.with_name(
+                destination.name + ".part"
+            )
+
+        content_length = headers_obj.get("Content-Length")
+
+        expected_response_size = (
+            int(content_length)
+            if content_length and content_length.isdigit()
+            else None
+        )
+
+        etag = headers_obj.get("ETag")
+        last_modified = headers_obj.get("Last-Modified")
+
+        mode = "ab" if offset and status == 206 else "wb"
+
+        downloaded_this_session = 0
+
+        with part.open(mode) as handle:
+
+            while True:
+                block = response.read(CHUNK_SIZE)
+
+                if not block:
+                    break
+
+                handle.write(block)
+                downloaded_this_session += len(block)
+
+        response.close()
+
+        actual_size = part.stat().st_size
+
+        # Content-Length refers to the response body.
+        # For a resumed 206 response, compare the newly received bytes.
+
+        if (
+            expected_response_size is not None
+            and downloaded_this_session != expected_response_size
+        ):
+            raise IOError(
+                "Downloaded response length mismatch: "
+                f"expected {expected_response_size}, "
+                f"received {downloaded_this_session}"
+            )
+
+        if actual_size <= 0:
+            raise IOError("Downloaded file is empty")
+
+        digest = sha256_file(part)
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        part.replace(destination)
+
+        relative = str(destination.relative_to(root))
+
+        duplicate = db.execute(
+            "SELECT path FROM files WHERE sha256=? LIMIT 1",
+            (digest,),
+        ).fetchone()
+
+        duplicate_group = digest[:16] if duplicate else None
 
         db.execute(
             """
-            UPDATE files
-            SET baseline_sha256=?,
-                observed_sha256=?,
-                size=?,
-                mtime_ns=?,
-                verified_at=?,
-                state='VERIFIED'
-            WHERE local_path=?
+            INSERT INTO files
+            (
+                candidate_id,
+                source_id,
+                url,
+                path,
+                filename,
+                size,
+                sha256,
+                etag,
+                last_modified,
+                downloaded_at,
+                verification_status,
+                duplicate_group
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                size=excluded.size,
+                sha256=excluded.sha256,
+                etag=excluded.etag,
+                last_modified=excluded.last_modified,
+                downloaded_at=excluded.downloaded_at,
+                verification_status='VERIFIED',
+                duplicate_group=excluded.duplicate_group
             """,
             (
+                row["id"],
+                row["source_id"],
+                url,
+                relative,
+                destination.name,
+                actual_size,
                 digest,
-                digest,
-                stat.st_size,
-                stat.st_mtime_ns,
-                now(),
-                relative
-            )
+                etag,
+                last_modified,
+                utc_now(),
+                "VERIFIED",
+                duplicate_group,
+            ),
         )
 
-    db.commit()
+        db.execute(
+            """
+            UPDATE candidates
+            SET filename=?
+            WHERE id=?
+            """,
+            (
+                destination.name,
+                row["id"],
+            ),
+        )
 
-    say("Baselines updated.")
+        db.commit()
 
+        log(
+            "info",
+            f"COMPLETE: {relative} "
+            f"({format_bytes(actual_size)}) "
+            f"SHA256={digest}",
+        )
 
-# ============================================================
-# ARCHIVE INVENTORY
-# ============================================================
+        event(
+            db,
+            "INFO",
+            "DOWNLOAD_COMPLETE",
+            f"{relative}; size={actual_size}; sha256={digest}",
+            url,
+        )
 
-def inspect_zip(db, root, path, relative):
+        return True
 
-    try:
+    except urllib.error.HTTPError as exc:
 
-        with zipfile.ZipFile(path, "r") as archive:
+        log(
+            "error",
+            f"HTTP ERROR {exc.code}: {url}",
+        )
 
-            bad = archive.testzip()
+        db.execute(
+            """
+            UPDATE candidates
+            SET status=?, error=?, last_checked=?
+            WHERE id=?
+            """,
+            (
+                exc.code,
+                str(exc),
+                utc_now(),
+                row["id"],
+            ),
+        )
 
-            for member in archive.infolist():
+        db.commit()
 
-                db.execute(
-                    """
-                    INSERT OR REPLACE INTO archive_members
-                    (
-                        archive_path,
-                        member_path,
-                        size,
-                        compressed_size,
-                        crc,
-                        kind,
-                        scanned_at
-                    )
-                    VALUES(?,?,?,?,?,?,?)
-                    """,
-                    (
-                        relative,
-                        member.filename,
-                        member.file_size,
-                        member.compress_size,
-                        "%08x" % member.CRC,
-                        "DIRECTORY" if member.is_dir() else "FILE",
-                        now()
-                    )
-                )
-
-            db.commit()
-
-            if bad:
-
-                log_event(
-                    db,
-                    "CRITICAL",
-                    "ZIP_CRC_ERROR",
-                    "",
-                    relative + " -> " + bad
-                )
-
-                return "CORRUPT"
-
-            return "OK"
-
-    except Exception as error:
-
-        log_event(
+        event(
             db,
             "ERROR",
-            "ZIP_READ_ERROR",
-            "",
-            relative + " | " + str(error)
+            "DOWNLOAD_HTTP_ERROR",
+            str(exc),
+            url,
         )
 
-        return "ERROR"
+        return False
 
+    except Exception as exc:
 
-def inspect_tar(db, root, path, relative):
+        log(
+            "error",
+            f"DOWNLOAD FAILED: {url}: {exc}",
+        )
 
-    try:
+        db.execute(
+            """
+            UPDATE candidates
+            SET error=?, last_checked=?
+            WHERE id=?
+            """,
+            (
+                str(exc),
+                utc_now(),
+                row["id"],
+            ),
+        )
 
-        with tarfile.open(path, "r:*") as archive:
+        db.commit()
 
-            for member in archive:
-
-                if not member.isfile() and not member.isdir():
-                    kind = "SPECIAL"
-                elif member.isdir():
-                    kind = "DIRECTORY"
-                else:
-                    kind = "FILE"
-
-                db.execute(
-                    """
-                    INSERT OR REPLACE INTO archive_members
-                    (
-                        archive_path,
-                        member_path,
-                        size,
-                        compressed_size,
-                        crc,
-                        kind,
-                        scanned_at
-                    )
-                    VALUES(?,?,?,?,?,?,?)
-                    """,
-                    (
-                        relative,
-                        member.name,
-                        member.size,
-                        None,
-                        None,
-                        kind,
-                        now()
-                    )
-                )
-
-            db.commit()
-
-        return "OK"
-
-    except Exception as error:
-
-        log_event(
+        event(
             db,
             "ERROR",
-            "TAR_READ_ERROR",
-            "",
-            relative + " | " + str(error)
+            "DOWNLOAD_ERROR",
+            str(exc),
+            url,
         )
 
-        return "ERROR"
-
-
-def inspect_archives(db, root):
-
-    say("\nARCHIVE INVENTORY")
-
-    checked = 0
-
-    for directory in DATA_DIRECTORIES:
-
-        base_directory = root / directory
-
-        if not base_directory.exists():
-            continue
-
-        for base, dirs, files in os.walk(base_directory):
-
-            for filename in files:
-
-                path = Path(base) / filename
-
-                extension = path.suffix.lower()
-
-                if extension not in (
-                    ".zip",
-                    ".tar",
-                    ".gz",
-                    ".tgz",
-                    ".bz2"
-                ):
-                    continue
-
-                relative = str(
-                    path.relative_to(root)
-                )
-
-                say("  " + relative)
-
-                if extension == ".zip":
-
-                    state = inspect_zip(
-                        db,
-                        root,
-                        path,
-                        relative
-                    )
-
-                else:
-
-                    state = inspect_tar(
-                        db,
-                        root,
-                        path,
-                        relative
-                    )
-
-                say("    " + state)
-
-                checked += 1
-
-    say("Archives inspected: " + str(checked))
-
-    return checked
-
-
-# ============================================================
-# DOWNLOAD ESTIMATE
-# ============================================================
-
-def download_estimate(db, root, settings):
-
-    rows = db.execute(
-        """
-        SELECT url,COALESCE(size_hint,0),state
-        FROM items
-        WHERE local_path IS NULL
-        """
-    ).fetchall()
-
-    count = 0
-    total = 0
-    unknown = 0
-    held = 0
-
-    for url, size, state in rows:
-
-        extension = get_extension(url)
-
-        if (
-            extension in MEDIA_EXTENSIONS
-            and not settings.get("include_media", False)
-        ):
-
-            held += 1
-            continue
-
-        if state == "HOLD_MEDIA":
-            held += 1
-            continue
-
-        count += 1
-        total += size
-
-        if size <= 0:
-            unknown += 1
-
-    disk = shutil.disk_usage(
-        str(root)
-    )
-
-    say("\nDOWNLOAD ESTIMATE")
-
-    say("  Pending: " + str(count))
-    say("  Known size: " + human_size(total))
-    say("  Unknown size: " + str(unknown))
-    say("  Held media: " + str(held))
-    say("  Free space: " + human_size(disk.free))
-
-    if total > disk.free:
-
-        say("\nWARNING: Known download size exceeds free space.")
-
-    if unknown:
-
-        say("WARNING: Some file sizes are unknown.")
-
-    return count, total, unknown
+        return False
 
 
 # ============================================================
 # DOWNLOAD QUEUE
 # ============================================================
 
-def download_pending(db, root, settings):
+def download_all(root: Path, db):
+    rows = candidates_for_download(db)
 
-    rows = db.execute(
-        """
-        SELECT
-            items.url,
-            item_sources.source_id,
-            sources.tier,
-            items.size_hint,
-            items.local_path
+    print("\nDOWNLOAD QUEUE")
+    print("-" * 50)
+    print("Items:", len(rows))
 
-        FROM items
+    known_size, unknown_count = estimate_download(db)
 
-        JOIN item_sources
-            ON item_sources.url=items.url
+    usage = disk_status(root)
 
-        JOIN sources
-            ON sources.source_id=item_sources.source_id
+    if known_size > usage.free:
+        print("\nWARNING: Known download size exceeds free space.")
+        print("The archive may not fit on this filesystem.")
 
-        WHERE items.local_path IS NULL
-          AND items.state NOT IN (
-              'HOLD_MEDIA',
-              'QUARANTINED'
-          )
+        if not ask_yes_no("Continue anyway?", False):
+            return
 
-        ORDER BY
-            sources.tier,
-            item_sources.source_id,
-            items.url
-        """
-    ).fetchall()
+    elif known_size > usage.free * 0.9:
+        print("\nWARNING: Download will consume most free space.")
 
-    # When multiple sources point to the same URL, the query may duplicate
-    # its record. Keep one source association for this download pass.
+        if not ask_yes_no("Continue anyway?", False):
+            return
 
-    unique = {}
-    for row in rows:
-        unique.setdefault(row[0], row)
+    if unknown_count:
+        print(
+            "\nSome resources have unknown sizes. "
+            "The final download size may be larger."
+        )
 
-    rows = list(unique.values())
+    if not ask_yes_no(
+        "Start downloading the available archive?",
+        False,
+    ):
+        print("\nDownload cancelled. Existing archive will still be verified.")
+        inventory(root, db)
+        verify_inventory(root, db)
+        return
 
-    results = {
-        "downloaded": 0,
-        "duplicate": 0,
-        "critical": 0,
-        "error": 0,
-        "held": 0
-    }
-
-    say("\nDOWNLOAD QUEUE")
-    say("  Items: " + str(len(rows)))
+    completed = 0
+    failed = 0
 
     for index, row in enumerate(rows, 1):
 
-        result = download_item(
-            db,
-            root,
-            row,
-            settings
+        print(
+            f"\n[{index}/{len(rows)}] "
+            f"{row['source_name'] or 'Unknown source'}"
         )
 
-        results[result] = results.get(result, 0) + 1
+        success = False
 
-        if index % 10 == 0:
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
 
-            say(
-                "  %d/%d | downloaded=%d | duplicate=%d | errors=%d" %
-                (
-                    index,
-                    len(rows),
-                    results["downloaded"],
-                    results["duplicate"],
-                    results["error"]
+            success = download_one(root, db, row)
+
+            if success:
+                break
+
+            if attempt < RETRY_ATTEMPTS:
+                log(
+                    "warning",
+                    f"Retry {attempt}/{RETRY_ATTEMPTS}: {row['url']}",
                 )
-            )
 
-    say("\nDOWNLOAD RESULTS")
+                time.sleep(RETRY_DELAY * attempt)
 
-    for key, value in results.items():
-        say("  %-12s %d" % (key, value))
+        if success:
+            completed += 1
+        else:
+            failed += 1
 
-    critical_count = db.execute(
-        """
-        SELECT COUNT(*)
-        FROM items
-        WHERE state='CRITICAL'
-        """
-    ).fetchone()[0]
+        time.sleep(DOWNLOAD_DELAY)
 
-    if critical_count:
+    print("\nDOWNLOAD SUMMARY")
+    print("-" * 50)
+    print("Completed:", completed)
+    print("Failed:   ", failed)
 
-        say(
-            "\nCritical failures: %d" %
-            critical_count
-        )
-
-        say(
-            "A critical failure does not block the remaining downloads."
-        )
-
-        answer = input(
-            "Retry critical URLs now? [y/N] "
-        ).strip().lower()
-
-        if answer in ("y", "yes", "да", "д"):
-
-            retry_critical(db, root, settings)
-
-    verify_local_files(db, root)
+    inventory(root, db)
+    verify_inventory(root, db)
 
 
-def retry_critical(db, root, settings):
+# ============================================================
+# RETRY FAILED URLS
+# ============================================================
 
+def retry_failed_urls(root: Path, db):
     rows = db.execute(
         """
-        SELECT
-            items.url,
-            item_sources.source_id,
-            sources.tier,
-            items.size_hint,
-            items.local_path
-
-        FROM items
-
-        JOIN item_sources
-            ON item_sources.url=items.url
-
-        JOIN sources
-            ON sources.source_id=item_sources.source_id
-
-        WHERE items.state IN (
-            'CRITICAL',
-            'ERROR'
-        )
-
-        ORDER BY items.url
+        SELECT c.*, s.name AS source_name,
+               s.source_type AS source_type,
+               s.trust_level AS trust_level
+        FROM candidates c
+        LEFT JOIN sources s ON s.id=c.source_id
+        WHERE
+            c.status IS NULL
+            OR c.status < 200
+            OR c.status >= 400
+            OR c.error IS NOT NULL
+        ORDER BY c.id
         """
     ).fetchall()
 
-    unique = {}
+    print("\nFAILED URLS:", len(rows))
+
+    if not rows:
+        print("No failed URLs.")
+        return
 
     for row in rows:
-        unique.setdefault(row[0], row)
-
-    rows = list(unique.values())
-
-    say(
-        "Retry candidates: " + str(len(rows))
-    )
-
-    for row in rows:
-
-        download_item(
-            db,
-            root,
-            row,
-            settings
+        print(
+            f"[{row['status']}] {row['url']} "
+            f":: {row['error'] or ''}"
         )
+
+    if not ask_yes_no("Retry these URLs?", False):
+        return
+
+    for index, row in enumerate(rows, 1):
+
+        print(f"\n[{index}/{len(rows)}] {row['url']}")
+
+        success = False
+
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+
+            status, ctype, size, final_url, error = probe_url(
+                row["url"]
+            )
+
+            db.execute(
+                """
+                UPDATE candidates
+                SET status=?,
+                    content_type=?,
+                    expected_size=?,
+                    last_checked=?,
+                    error=?
+                WHERE id=?
+                """,
+                (
+                    status,
+                    ctype,
+                    size,
+                    utc_now(),
+                    error,
+                    row["id"],
+                ),
+            )
+
+            db.commit()
+
+            if is_success(status):
+                success = True
+                break
+
+            time.sleep(RETRY_DELAY * attempt)
+
+        if success and row["download_enabled"] and not row["manual_review"]:
+            refreshed = db.execute(
+                """
+                SELECT c.*, s.name AS source_name,
+                       s.source_type AS source_type,
+                       s.trust_level AS trust_level
+                FROM candidates c
+                LEFT JOIN sources s ON s.id=c.source_id
+                WHERE c.id=?
+                """,
+                (row["id"],),
+            ).fetchone()
+
+            download_one(root, db, refreshed)
+
+    inventory(root, db)
+    verify_inventory(root, db)
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+def show_status(root: Path, db):
+    print("\nARCHIVE STATUS")
+    print("=" * 60)
+
+    source_count = db.execute(
+        "SELECT COUNT(*) FROM sources"
+    ).fetchone()[0]
+
+    available_sources = db.execute(
+        """
+        SELECT COUNT(*) FROM sources
+        WHERE status >= 200 AND status < 400
+        """
+    ).fetchone()[0]
+
+    candidate_count = db.execute(
+        "SELECT COUNT(*) FROM candidates"
+    ).fetchone()[0]
+
+    available_candidates = db.execute(
+        """
+        SELECT COUNT(*) FROM candidates
+        WHERE status >= 200 AND status < 400
+        """
+    ).fetchone()[0]
+
+    failed_candidates = db.execute(
+        """
+        SELECT COUNT(*) FROM candidates
+        WHERE status IS NULL
+           OR status < 200
+           OR status >= 400
+        """
+    ).fetchone()[0]
+
+    manual_count = db.execute(
+        """
+        SELECT COUNT(*) FROM candidates
+        WHERE manual_review=1
+        """
+    ).fetchone()[0]
+
+    file_count = db.execute(
+        "SELECT COUNT(*) FROM files"
+    ).fetchone()[0]
+
+    total_size = db.execute(
+        "SELECT SUM(size) FROM files"
+    ).fetchone()[0] or 0
+
+    print("Sources:             ", source_count)
+    print("Available sources:   ", available_sources)
+    print("Discovered URLs:     ", candidate_count)
+    print("Available URLs:      ", available_candidates)
+    print("Failed URLs:         ", failed_candidates)
+    print("Manual review URLs:  ", manual_count)
+    print("Local files:         ", file_count)
+    print("Local file size:     ", format_bytes(total_size))
+
+    disk_status(root)
 
 
 # ============================================================
 # MANIFEST EXPORT
 # ============================================================
 
-def export_manifests(db, root):
+def export_manifests(root: Path, db):
+    manifest_dir = root / "07_MANIFESTS"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    say("\nEXPORTING MANIFESTS")
-
-    fields = [
-
-        "url",
-        "source_id",
-        "tier",
-
-        "status_code",
-        "content_type",
-
-        "size_hint",
-        "filename",
-
-        "local_path",
-        "sha256",
-
-        "state",
-        "error"
-    ]
-
-    rows = db.execute(
+    candidates = db.execute(
         """
-        SELECT
-            items.url,
-            item_sources.source_id,
-            sources.tier,
-
-            items.status_code,
-            items.content_type,
-
-            items.size_hint,
-            items.filename,
-
-            items.local_path,
-            items.sha256,
-
-            items.state,
-            items.error
-
-        FROM items
-
-        LEFT JOIN item_sources
-            ON item_sources.url=items.url
-
-        LEFT JOIN sources
-            ON sources.source_id=item_sources.source_id
-
-        ORDER BY item_sources.source_id,items.url
+        SELECT c.*, s.name AS source_name,
+               s.source_type, s.trust_level
+        FROM candidates c
+        LEFT JOIN sources s ON s.id=c.source_id
+        ORDER BY c.id
         """
     ).fetchall()
 
-    path = root / "07_MANIFESTS" / "master_manifest.jsonl"
+    with (manifest_dir / "master_manifest.jsonl").open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
 
-    with open(path, "w", encoding="utf-8") as output:
-
-        for row in rows:
-
-            record = dict(zip(fields, row))
-
-            output.write(
+        for row in candidates:
+            handle.write(
                 json.dumps(
-                    record,
-                    ensure_ascii=False
+                    dict(row),
+                    ensure_ascii=False,
                 ) + "\n"
             )
 
-    failures = db.execute(
-        """
-        SELECT
-            url,
-            status_code,
-            state,
-            error
+    files = db.execute(
+        "SELECT * FROM files ORDER BY path"
+    ).fetchall()
 
-        FROM items
+    with (manifest_dir / "local_files.jsonl").open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
 
-        WHERE state IN (
-            'CRITICAL',
-            'ERROR',
-            'MISSING',
-            'CORRUPT',
-            'QUARANTINED'
+        for row in files:
+            handle.write(
+                json.dumps(
+                    dict(row),
+                    ensure_ascii=False,
+                ) + "\n"
+            )
+
+    sources = db.execute(
+        "SELECT * FROM sources ORDER BY id"
+    ).fetchall()
+
+    with (manifest_dir / "sources.json").open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
+
+        json.dump(
+            [dict(row) for row in sources],
+            handle,
+            ensure_ascii=False,
+            indent=2,
         )
 
-        ORDER BY state,url
+    failed = db.execute(
+        """
+        SELECT url, status, error, last_checked
+        FROM candidates
+        WHERE status IS NULL
+           OR status < 200
+           OR status >= 400
         """
     ).fetchall()
 
-    failure_data = []
+    with (manifest_dir / "failed_urls.json").open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
 
-    for url, status, state, error in failures:
-
-        failure_data.append(
-            {
-                "url": url,
-                "status_code": status,
-                "state": state,
-                "error": error
-            }
+        json.dump(
+            [dict(row) for row in failed],
+            handle,
+            ensure_ascii=False,
+            indent=2,
         )
 
-    write_json(
-        root / "07_MANIFESTS" / "critical_failures.json",
-        failure_data
-    )
-
-    source_rows = db.execute(
+    duplicates = db.execute(
         """
-        SELECT source_id,name,tier,url,adapter,active,status,last_checked
-        FROM sources
-        ORDER BY tier,name
-        """
-    ).fetchall()
-
-    source_fields = [
-        "source_id",
-        "name",
-        "tier",
-        "url",
-        "adapter",
-        "active",
-        "status",
-        "last_checked"
-    ]
-
-    write_json(
-        root / "07_MANIFESTS" / "sources.json",
-        [
-            dict(zip(source_fields, row))
-            for row in source_rows
-        ]
-    )
-
-    say("  URLs: " + str(len(rows)))
-    say("  Failures: " + str(len(failure_data)))
-
-
-# ============================================================
-# STATUS REPORT
-# ============================================================
-
-def show_status(db):
-
-    say("\nARCHIVE STATUS")
-
-    rows = db.execute(
-        """
-        SELECT state,COUNT(*)
-        FROM items
-        GROUP BY state
-        ORDER BY state
-        """
-    ).fetchall()
-
-    for state, count in rows:
-
-        say(
-            "  %-18s %d" %
-            (state, count)
-        )
-
-    file_rows = db.execute(
-        """
-        SELECT state,COUNT(*)
+        SELECT duplicate_group, COUNT(*) AS count,
+               GROUP_CONCAT(path, ' | ') AS paths
         FROM files
-        GROUP BY state
-        ORDER BY state
+        WHERE duplicate_group IS NOT NULL
+        GROUP BY duplicate_group
         """
     ).fetchall()
 
-    say("\nLOCAL FILES")
+    with (manifest_dir / "duplicates.json").open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
 
-    for state, count in file_rows:
-
-        say(
-            "  %-18s %d" %
-            (state, count)
+        json.dump(
+            [dict(row) for row in duplicates],
+            handle,
+            ensure_ascii=False,
+            indent=2,
         )
+
+    print("Manifests exported to:", manifest_dir)
 
 
 # ============================================================
-# OCR
+# DISCOVERY WORKFLOW
 # ============================================================
 
-def command_exists(name):
+def run_discovery(root: Path, db):
+    register_sources(db)
 
-    return shutil.which(name) is not None
+    disk_status(root)
 
+    print("\n[PHASE 1] SOURCE CHECK")
+    probe_sources(db)
 
-def output_name_for(path):
+    print("\n[PHASE 2] DISCOVERY")
+    discover_all(db)
 
-    name = safe_name(path.stem)
+    print("\n[PHASE 3] CANDIDATE PREFLIGHT")
+    probe_candidates(db)
 
-    return name[:150]
+    print("\n[PHASE 4] SIZE ESTIMATION")
+    estimate_download(db)
 
+    show_status(root, db)
 
-def ocr_image(path, output, languages):
-
-    tesseract = shutil.which("tesseract")
-
-    if not tesseract:
-
-        raise RuntimeError(
-            "tesseract not installed"
-        )
-
-    result = subprocess.run(
-        [
-            tesseract,
-            str(path),
-            "stdout",
-            "-l",
-            languages
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=None
-    )
-
-    if result.returncode != 0:
-
-        raise RuntimeError(
-            result.stderr.decode(
-                "utf-8",
-                errors="replace"
-            )
-        )
-
-    output.write_bytes(
-        result.stdout
-    )
-
-
-def extract_pdf_text(path, output):
-
-    pdftotext = shutil.which("pdftotext")
-
-    if not pdftotext:
-        return False
-
-    result = subprocess.run(
-        [
-            pdftotext,
-            "-layout",
-            str(path),
-            "-"
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=None
-    )
-
-    if result.returncode != 0:
-        return False
-
-    text = result.stdout.decode(
-        "utf-8",
-        errors="replace"
-    )
-
-    if not text.strip():
-        return False
-
-    output.write_text(
-        text,
-        encoding="utf-8"
-    )
-
-    return True
-
-
-def ocr_pdf(path, output_dir, languages):
-
-    pdftoppm = shutil.which("pdftoppm")
-    tesseract = shutil.which("tesseract")
-
-    if not pdftoppm or not tesseract:
-
-        raise RuntimeError(
-            "PDF OCR requires pdftoppm and tesseract"
-        )
-
-    base_name = output_name_for(path)
-
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    text_output = output_dir / (
-        base_name + ".txt"
-    )
-
-    # First try normal text extraction.
-
-    if extract_pdf_text(
-        path,
-        text_output
+    if ask_yes_no(
+        "\nProceed to download?",
+        False,
     ):
+        download_all(root, db)
 
-        return "EXTRACTED_TEXT"
+    else:
+        print("\nDownload skipped.")
+        print("Existing archive will be inventoried and verified.")
 
-    pdfinfo = shutil.which("pdfinfo")
+        inventory(root, db)
+        verify_inventory(root, db)
 
-    if not pdfinfo:
-
-        raise RuntimeError(
-            "pdfinfo is required for page enumeration"
-        )
-
-    info = subprocess.run(
-        [
-            pdfinfo,
-            str(path)
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=None
-    )
-
-    page_match = re.search(
-        r"^Pages:\s+(\d+)",
-        info.stdout,
-        re.M
-    )
-
-    if not page_match:
-
-        raise RuntimeError(
-            "Could not determine PDF page count"
-        )
-
-    page_count = int(page_match.group(1))
-
-    all_text = []
-
-    with tempfile.TemporaryDirectory() as temporary:
-
-        temporary = Path(temporary)
-
-        for page in range(1, page_count + 1):
-
-            prefix = temporary / "page"
-
-            subprocess.run(
-                [
-                    pdftoppm,
-                    "-f", str(page),
-                    "-l", str(page),
-                    "-r", "200",
-                    "-png",
-                    str(path),
-                    str(prefix)
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=None
-            )
-
-            images = list(
-                temporary.glob("page-*.png")
-            )
-
-            if not images:
-                continue
-
-            image_path = images[-1]
-
-            result = subprocess.run(
-                [
-                    tesseract,
-                    str(image_path),
-                    "stdout",
-                    "-l",
-                    languages
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=None
-            )
-
-            if result.returncode == 0:
-
-                page_text = result.stdout.decode(
-                    "utf-8",
-                    errors="replace"
-                )
-
-                all_text.append(
-                    "\n\n===== PAGE %d =====\n\n%s" %
-                    (page, page_text)
-                )
-
-            if page % 25 == 0:
-
-                say(
-                    "  OCR page %d / %d" %
-                    (page, page_count)
-                )
-
-    text_output.write_text(
-        "\n".join(all_text),
-        encoding="utf-8"
-    )
-
-    return "OCR"
-
-
-def run_ocr(root, db, settings):
-
-    say("\nOCR")
-
-    languages = settings.get(
-        "ocr_languages",
-        "eng+rus"
-    )
-
-    tesseract = shutil.which("tesseract")
-
-    if not tesseract:
-
-        say("Tesseract not installed.")
-        say("Install Tesseract before using OCR.")
-        return
-
-    processed = 0
-    failed = 0
-
-    for directory in DATA_DIRECTORIES:
-
-        base_directory = root / directory
-
-        if not base_directory.exists():
-            continue
-
-        for base, dirs, files in os.walk(base_directory):
-
-            for filename in files:
-
-                path = Path(base) / filename
-
-                extension = path.suffix.lower()
-
-                if extension not in (
-                    ".pdf",
-                    ".jpg",
-                    ".jpeg",
-                    ".png",
-                    ".tif",
-                    ".tiff",
-                    ".bmp",
-                    ".webp"
-                ):
-                    continue
-
-                relative = path.relative_to(root)
-
-                output_dir = (
-                    root /
-                    "05_DERIVED" /
-                    "OCR" /
-                    relative.parent
-                )
-
-                output_dir.mkdir(
-                    parents=True,
-                    exist_ok=True
-                )
-
-                output_name = output_name_for(path)
-
-                output = output_dir / (
-                    output_name + ".txt"
-                )
-
-                if output.exists():
-                    continue
-
-                say("  " + str(relative))
-
-                try:
-
-                    if extension == ".pdf":
-
-                        method = ocr_pdf(
-                            path,
-                            output_dir,
-                            languages
-                        )
-
-                    else:
-
-                        ocr_image(
-                            path,
-                            output,
-                            languages
-                        )
-
-                        method = "OCR"
-
-                    log_event(
-                        db,
-                        "INFO",
-                        "OCR_COMPLETE",
-                        "",
-                        str(relative) + " | " + method
-                    )
-
-                    processed += 1
-
-                except Exception as error:
-
-                    failed += 1
-
-                    log_event(
-                        db,
-                        "ERROR",
-                        "OCR_ERROR",
-                        "",
-                        str(relative) + " | " + str(error)
-                    )
-
-    db.commit()
-
-    say("OCR finished.")
-    say("  Processed: " + str(processed))
-    say("  Failed: " + str(failed))
+    export_manifests(root, db)
 
 
 # ============================================================
-# TRANSLATION
+# MONITORING
 # ============================================================
 
-def split_text(text, limit=3500):
-
-    chunks = []
-
-    while len(text) > limit:
-
-        position = text.rfind(
-            "\n",
-            0,
-            limit
-        )
-
-        if position < limit // 2:
-            position = limit
-
-        chunks.append(
-            text[:position]
-        )
-
-        text = text[position:]
-
-    if text:
-        chunks.append(text)
-
-    return chunks
-
-
-def run_translation(root, db, settings):
-
-    say("\nARGOS TRANSLATION")
-
-    try:
-
-        import argostranslate.translate as argos_translate
-
-    except ImportError:
-
-        say("Argos Translate is not installed.")
-        say("Install it separately and download the required language model.")
-        return
-
-    source_code = settings.get(
-        "translation_from",
-        "en"
-    )
-
-    target_code = settings.get(
-        "translation_to",
-        "ru"
-    )
-
-    languages = argos_translate.get_installed_languages()
-
-    source_language = None
-    target_language = None
-
-    for language in languages:
-
-        if language.code == source_code:
-            source_language = language
-
-        if language.code == target_code:
-            target_language = language
-
-    if not source_language or not target_language:
-
-        say(
-            "Required installed language models are missing: "
-            + source_code + " -> " + target_code
-        )
-
-        say(
-            "Install the Argos language package before translating."
-        )
-
-        return
-
-    translation = source_language.get_translation(
-        target_language
-    )
-
-    input_roots = [
-
-        root / "05_DERIVED" / "OCR",
-
-        root / "05_DERIVED" / "EXTRACTED_TEXT",
-
-        root / "05_DERIVED" / "TRANSCRIPTS"
-
-    ]
-
-    output_root = (
-        root / "05_DERIVED" / "TRANSLATIONS"
-    )
-
-    output_root.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    processed = 0
-    failed = 0
-
-    for input_root in input_roots:
-
-        if not input_root.exists():
-            continue
-
-        for base, dirs, files in os.walk(input_root):
-
-            for filename in files:
-
-                if not filename.lower().endswith(".txt"):
-                    continue
-
-                source_path = Path(base) / filename
-
-                relative = source_path.relative_to(
-                    root / "05_DERIVED"
-                )
-
-                target_path = (
-                    output_root /
-                    relative.parent /
-                    (source_path.stem + "." + target_code + ".txt")
-                )
-
-                if target_path.exists():
-                    continue
-
-                try:
-
-                    text = source_path.read_text(
-                        encoding="utf-8",
-                        errors="replace"
-                    )
-
-                    translated = []
-
-                    chunks = split_text(text)
-
-                    for index, chunk in enumerate(chunks, 1):
-
-                        translated.append(
-                            translation.translate(chunk)
-                        )
-
-                        if index % 20 == 0:
-
-                            say(
-                                "  Chunks: %d / %d" %
-                                (index, len(chunks))
-                            )
-
-                    target_path.parent.mkdir(
-                        parents=True,
-                        exist_ok=True
-                    )
-
-                    target_path.write_text(
-                        "\n".join(translated),
-                        encoding="utf-8"
-                    )
-
-                    processed += 1
-
-                except Exception as error:
-
-                    failed += 1
-
-                    log_event(
-                        db,
-                        "ERROR",
-                        "TRANSLATION_ERROR",
-                        "",
-                        str(source_path) + " | " + str(error)
-                    )
-
-    db.commit()
-
-    say("Translation finished.")
-    say("  Processed: " + str(processed))
-    say("  Failed: " + str(failed))
-
-
-# ============================================================
-# WHISPER TRANSCRIPTION
-# ============================================================
-
-def run_transcription(root, db, settings):
-
-    say("\nWHISPER TRANSCRIPTION")
-
-    whisper = shutil.which("whisper")
-
-    if not whisper:
-
-        say("Whisper CLI not installed.")
-        say("Install Whisper and FFmpeg separately.")
-        return
-
-    model = settings.get(
-        "whisper_model",
-        "small"
-    )
-
-    processed = 0
-    failed = 0
-
-    for directory in DATA_DIRECTORIES:
-
-        base_directory = root / directory
-
-        if not base_directory.exists():
-            continue
-
-        for base, dirs, files in os.walk(base_directory):
-
-            for filename in files:
-
-                path = Path(base) / filename
-
-                extension = path.suffix.lower()
-
-                if extension not in MEDIA_EXTENSIONS:
-                    continue
-
-                # Image files are not audio/video.
-
-                if extension in (
-                    ".jpg", ".jpeg", ".png", ".gif",
-                    ".tif", ".tiff", ".webp", ".bmp"
-                ):
-                    continue
-
-                relative = path.relative_to(root)
-
-                output_dir = (
-                    root /
-                    "05_DERIVED" /
-                    "TRANSCRIPTS" /
-                    relative.parent
-                )
-
-                output_dir.mkdir(
-                    parents=True,
-                    exist_ok=True
-                )
-
-                output_file = output_dir / (
-                    path.stem + ".txt"
-                )
-
-                if output_file.exists():
-                    continue
-
-                say("  " + str(relative))
-
-                try:
-
-                    result = subprocess.run(
-                        [
-                            whisper,
-                            str(path),
-                            "--model",
-                            model,
-                            "--output_dir",
-                            str(output_dir),
-                            "--output_format",
-                            "txt",
-                            "--fp16",
-                            "False"
-                        ],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        timeout=None
-                    )
-
-                    if result.returncode == 0:
-
-                        processed += 1
-
-                    else:
-
-                        failed += 1
-
-                        log_event(
-                            db,
-                            "ERROR",
-                            "WHISPER_ERROR",
-                            "",
-                            result.stdout[-3000:]
-                        )
-
-                except Exception as error:
-
-                    failed += 1
-
-                    log_event(
-                        db,
-                        "ERROR",
-                        "WHISPER_ERROR",
-                        "",
-                        str(path) + " | " + str(error)
-                    )
-
-    db.commit()
-
-    say("Transcription finished.")
-    say("  Processed: " + str(processed))
-    say("  Failed: " + str(failed))
-
-
-# ============================================================
-# FULL HEALTH CHECK
-# ============================================================
-
-def health_check(root, db, args):
-
-    say("\nFULL HEALTH CHECK")
-
-    disk_report(root)
-
-    smart_report(
-        root,
-        args.device
-    )
-
-    quick_write_test(root)
-
-    result = verify_local_files(
-        db,
-        root
-    )
-
-    say("\nHEALTH SUMMARY")
-
-    for key, value in result.items():
-
-        say(
-            "  %-12s %d" %
-            (key, value)
-        )
-
-
-# ============================================================
-# FULL CYCLE
-# ============================================================
-
-def full_cycle(root, db, settings, args):
-
-    say("\nFULL ARCHIVE CYCLE")
-
-    health_check(
-        root,
-        db,
-        args
-    )
-
-    discover_all(
-        db,
-        settings
-    )
-
-    probe_all(
-        db,
-        settings
-    )
-
-    export_manifests(
-        db,
-        root
-    )
-
-    show_status(db)
-
-    count, size, unknown = download_estimate(
-        db,
-        root,
-        settings
-    )
-
-    if count == 0:
-
-        say("\nNothing pending.")
-        return
-
-    answer = input(
-        "\nStart download? [y/N] "
-    ).strip().lower()
-
-    if answer not in ("y", "yes", "да", "д"):
-
-        say("Download skipped.")
-
-        verify_local_files(
-            db,
-            root
-        )
-
-        export_manifests(
-            db,
-            root
-        )
-
-        return
-
-    download_pending(
-        db,
-        root,
-        settings
-    )
-
-    inspect_archives(
-        db,
-        root
-    )
-
-    export_manifests(
-        db,
-        root
-    )
-
-    show_status(db)
-
-
-# ============================================================
-# CONTINUOUS MODE
-# ============================================================
-
-def continuous_mode(root, db, settings, args):
-
-    interval = int(
-        input(
-            "Interval in minutes [1440]: "
-        ).strip() or "1440"
-    )
-
-    say("\nCONTINUOUS MODE")
-
-    say("Press Ctrl+C to stop.")
+def monitor_mode(root: Path, db):
+    print("\nMONITORING MODE")
+    print("Interval:", MONITOR_INTERVAL_HOURS, "hours")
+    print("Press CTRL+C to stop.")
 
     while True:
-
         try:
+            print("\n" + "=" * 60)
+            print("MONITOR CYCLE:", utc_now())
+            print("=" * 60)
 
-            full_cycle(
-                root,
-                db,
-                settings,
-                args
-            )
+            register_sources(db)
+            probe_sources(db)
+            discover_all(db)
+            probe_candidates(db)
 
-            say(
-                "\nNext cycle in %d minutes." %
-                interval
+            inventory(root, db)
+            verify_inventory(root, db)
+
+            export_manifests(root, db)
+
+            log(
+                "info",
+                "Monitoring cycle completed.",
             )
 
             time.sleep(
-                max(1, interval) * 60
+                MONITOR_INTERVAL_HOURS * 3600
             )
 
         except KeyboardInterrupt:
-
-            say("\nContinuous mode stopped.")
+            print("\nMonitoring stopped.")
             break
 
-
-# ============================================================
-# SETTINGS MENU
-# ============================================================
-
-def settings_menu(root, settings):
-
-    while True:
-
-        say("\nSETTINGS")
-
-        print("1. Request delay")
-        print("2. Retry count")
-        print("3. Crawl depth")
-        print("4. Page limit")
-        print("5. Include media")
-        print("6. Respect robots.txt")
-        print("7. OCR languages")
-        print("8. Translation source language")
-        print("9. Translation target language")
-        print("10. Whisper model")
-        print("11. Internet Archive query")
-        print("12. User-Agent")
-        print("0. Back")
-
-        choice = input("\nChoice: ").strip()
-
-        if choice == "0":
-            break
-
-        elif choice == "1":
-
-            value = input("Delay in seconds: ").strip()
-
-            settings["delay"] = max(
-                0.0,
-                float(value)
+        except Exception as exc:
+            log(
+                "error",
+                f"Monitoring cycle failed: {exc}",
             )
 
-        elif choice == "2":
-
-            settings["retries"] = max(
-                1,
-                int(input("Retries: "))
-            )
-
-        elif choice == "3":
-
-            settings["crawl_depth"] = max(
-                0,
-                min(5, int(input("Depth: ")))
-            )
-
-        elif choice == "4":
-
-            settings["page_limit"] = max(
-                0,
-                int(input("Page limit (0 = unlimited): "))
-            )
-
-        elif choice == "5":
-
-            settings["include_media"] = (
-                not settings["include_media"]
-            )
-
-        elif choice == "6":
-
-            settings["respect_robots"] = (
-                not settings["respect_robots"]
-            )
-
-        elif choice == "7":
-
-            settings["ocr_languages"] = input(
-                "Tesseract languages [eng+rus]: "
-            ).strip() or "eng+rus"
-
-        elif choice == "8":
-
-            settings["translation_from"] = input(
-                "Source language [en]: "
-            ).strip() or "en"
-
-        elif choice == "9":
-
-            settings["translation_to"] = input(
-                "Target language [ru]: "
-            ).strip() or "ru"
-
-        elif choice == "10":
-
-            settings["whisper_model"] = input(
-                "Whisper model [small]: "
-            ).strip() or "small"
-
-        elif choice == "11":
-
-            settings["internet_archive_query"] = input(
-                "Internet Archive query: "
-            ).strip()
-
-        elif choice == "12":
-
-            settings["user_agent"] = input(
-                "User-Agent: "
-            ).strip() or USER_AGENT
-
-        save_settings(
-            root,
-            settings
-        )
-
-        say("Settings saved.")
+            time.sleep(60)
 
 
 # ============================================================
-# MENU
+# INITIALIZATION
 # ============================================================
 
-def print_menu():
+def first_run_check(root: Path, db):
+    print("\nINITIAL ARCHIVE CHECK")
+    print("-" * 50)
 
-    print("""
-==========================================================
-             EPSTEIN PUBLIC RECORDS ARCHIVER
-==========================================================
+    file_count = sum(
+        1 for path in root.rglob("*")
+        if path.is_file()
+        and path.name != DATABASE_NAME
+        and not path.name.endswith(".part")
+    )
 
-  1. Full cycle
-  2. Discover sources and files
-  3. Probe indexed URLs
-  4. Calculate download estimate
-  5. Download pending files
-  6. Verify files and SHA-256
-  7. Retry critical failures
-  8. Inspect ZIP/TAR archives
-  9. OCR PDFs and images
- 10. Translate extracted text with Argos
- 11. Transcribe audio/video with Whisper
- 12. Full disk and archive health check
- 13. Export manifests and reports
- 14. Show archive status
- 15. List source registry
- 16. Add custom source
- 17. Enable/disable source
- 18. Settings
- 19. Continuous mode
+    print("Existing files:", file_count)
 
-  0. Exit
+    if file_count == 0:
+        print("Archive appears empty.")
+        inventory(root, db)
+        return
 
-==========================================================
-""")
+    print("Existing archive detected.")
+    print("Only the selected archive directory will be scanned.")
 
-
-def menu(root, db, settings, args):
-
-    while True:
-
-        print_menu()
-
-        choice = input("Command: ").strip()
-
-        try:
-
-            if choice == "0":
-
-                say("Exiting.")
-                break
-
-            elif choice == "1":
-
-                full_cycle(
-                    root,
-                    db,
-                    settings,
-                    args
-                )
-
-            elif choice == "2":
-
-                discover_all(
-                    db,
-                    settings
-                )
-
-            elif choice == "3":
-
-                probe_all(
-                    db,
-                    settings
-                )
-
-            elif choice == "4":
-
-                download_estimate(
-                    db,
-                    root,
-                    settings
-                )
-
-            elif choice == "5":
-
-                count, total, unknown = download_estimate(
-                    db,
-                    root,
-                    settings
-                )
-
-                if count:
-
-                    answer = input(
-                        "Start downloading? [y/N] "
-                    ).strip().lower()
-
-                    if answer in ("y", "yes", "да", "д"):
-
-                        download_pending(
-                            db,
-                            root,
-                            settings
-                        )
-
-            elif choice == "6":
-
-                verify_local_files(
-                    db,
-                    root
-                )
-
-                rebaseline_file(
-                    db,
-                    root
-                )
-
-            elif choice == "7":
-
-                retry_critical(
-                    db,
-                    root,
-                    settings
-                )
-
-            elif choice == "8":
-
-                inspect_archives(
-                    db,
-                    root
-                )
-
-            elif choice == "9":
-
-                run_ocr(
-                    root,
-                    db,
-                    settings
-                )
-
-            elif choice == "10":
-
-                run_translation(
-                    root,
-                    db,
-                    settings
-                )
-
-            elif choice == "11":
-
-                run_transcription(
-                    root,
-                    db,
-                    settings
-                )
-
-            elif choice == "12":
-
-                health_check(
-                    root,
-                    db,
-                    args
-                )
-
-            elif choice == "13":
-
-                export_manifests(
-                    db,
-                    root
-                )
-
-            elif choice == "14":
-
-                show_status(db)
-
-            elif choice == "15":
-
-                list_sources(db)
-
-            elif choice == "16":
-
-                add_custom_source(db)
-
-            elif choice == "17":
-
-                toggle_source(db)
-
-            elif choice == "18":
-
-                settings_menu(
-                    root,
-                    settings
-                )
-
-            elif choice == "19":
-
-                continuous_mode(
-                    root,
-                    db,
-                    settings,
-                    args
-                )
-
-            else:
-
-                say("Unknown command.")
-
-        except KeyboardInterrupt:
-
-            say("\nOperation interrupted.")
-            say("Current partial downloads are retained.")
-
-        except Exception as error:
-
-            say("\nOperation failed:")
-            say(str(error))
-
-            log_event(
-                db,
-                "ERROR",
-                "MENU_OPERATION_ERROR",
-                "",
-                str(error)
-            )
-
-        pause()
+    if ask_yes_no(
+        "Inventory and verify existing files now?",
+        True,
+    ):
+        inventory(root, db)
+        verify_inventory(root, db)
 
 
 # ============================================================
-# COMMAND LINE
+# MAIN
 # ============================================================
 
 def main():
+    banner()
 
-    parser = argparse.ArgumentParser(
-        description=APP_NAME
-    )
+    root = choose_root()
 
-    parser.add_argument(
-        "--root",
-        help="Archive directory"
-    )
+    initialize_layout(root)
+    setup_logging(root)
 
-    parser.add_argument(
-        "--device",
-        help="Disk device for SMART check"
-    )
+    log("info", f"Archive root: {root}")
 
-    parser.add_argument(
-        "--discover",
-        action="store_true"
-    )
+    db = connect_db(root)
 
-    parser.add_argument(
-        "--verify",
-        action="store_true"
-    )
+    try:
+        register_sources(db)
 
-    parser.add_argument(
-        "--full",
-        action="store_true"
-    )
+        first_run_check(root, db)
 
-    parser.add_argument(
-        "--include-media",
-        action="store_true"
-    )
+        while True:
+            menu()
 
-    parser.add_argument(
-        "--no-menu",
-        action="store_true"
-    )
+            choice = input("Select operation: ").strip()
 
-    args = parser.parse_args()
+            if choice == "1":
+                run_discovery(root, db)
 
-    say(APP_NAME + " v" + VERSION)
+            elif choice == "2":
+                inventory(root, db)
+                verify_inventory(root, db)
+                export_manifests(root, db)
 
-    say("Python: " + platform.python_version())
+            elif choice == "3":
+                show_status(root, db)
 
-    say("One download at a time.")
-    say("Streaming downloads.")
-    say("No configured maximum file size.")
-    say("No automatic filesystem repair.")
+            elif choice == "4":
+                retry_failed_urls(root, db)
 
-    root_value = args.root
+            elif choice == "5":
+                monitor_mode(root, db)
 
-    if not root_value:
+            elif choice == "6":
+                disk_status(root)
+                check_smart()
 
-        root_value = input(
-            "\nArchive directory "
-            "[./EPSTEIN_ARCHIVE]: "
-        ).strip()
+            elif choice == "7":
+                export_manifests(root, db)
 
-    if not root_value:
-        root_value = "./EPSTEIN_ARCHIVE"
+            elif choice == "0":
+                print("\nExiting.")
+                break
 
-    root = Path(
-        root_value
-    ).expanduser().resolve()
+            else:
+                print("Unknown command.")
 
-    if not root.exists():
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
 
-        answer = input(
-            "\nDirectory does not exist:\n"
-            + str(root) +
-            "\nCreate it? [Y/n] "
-        ).strip().lower()
+    finally:
+        db.commit()
+        db.close()
 
-        if answer in ("n", "no", "нет", "н"):
-
-            say("Stopped.")
-            return
-
-    initialize(root)
-
-    say("\nArchive directory:")
-    say(str(root))
-
-    disk_report(root)
-
-    settings = get_settings(root)
-
-    if args.include_media:
-        settings["include_media"] = True
-
-    db = open_database(root)
-
-    if args.verify:
-
-        verify_local_files(
-            db,
-            root
-        )
-
-        export_manifests(
-            db,
-            root
-        )
-
-    elif args.discover:
-
-        discover_all(
-            db,
-            settings
-        )
-
-        probe_all(
-            db,
-            settings
-        )
-
-        export_manifests(
-            db,
-            root
-        )
-
-    elif args.full:
-
-        full_cycle(
-            root,
-            db,
-            settings,
-            args
-        )
-
-    elif args.no_menu:
-
-        full_cycle(
-            root,
-            db,
-            settings,
-            args
-        )
-
-    else:
-
-        menu(
-            root,
-            db,
-            settings,
-            args
-        )
-
-    db.close()
-
-    say("\nARCHIVER FINISHED")
+        print("\nArchive session closed.")
 
 
 if __name__ == "__main__":
-
-    try:
-
-        main()
-
-    except KeyboardInterrupt:
-
-        say("\nStopped by user.")
-        say("Partial downloads are preserved.")
-        sys.exit(130)
-
-    except Exception as error:
-
-        say("\nFATAL ERROR")
-        say(str(error))
-        sys.exit(1)
+    main()
